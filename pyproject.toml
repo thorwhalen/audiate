@@ -155,6 +155,9 @@ enabled = false
 [tool.wads.ci.quality.mypy]
 enabled = false
 
+[tool.wads.ci.install]
+extras = "test"
+
 [tool.wads.ci.testing]
 python_versions = [
     "3.10",
@@ -183,10 +186,10 @@ sdist = true
 wheel = true
 
 [tool.wads.ci.publish]
-enabled = true
+enabled = false
 
 [tool.wads.ci.docs]
-enabled = true
+enabled = false
 builder = "epythet"
 ignore_paths = [
     "tests/",
