@@ -186,7 +186,7 @@ sdist = true
 wheel = true
 
 [tool.wads.ci.publish]
-enabled = false
+enabled = true
 
 [tool.wads.ci.docs]
 enabled = false
