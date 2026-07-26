@@ -19,6 +19,9 @@ Complex things possible::
     # pick an engine + SoundFont explicitly
     audio = audiate.render("tune.abc", engine="fluidsynth", soundfont="MyPiano.sf2")
 
+    # a chord chart -> backing track (needs accompy: pip install 'audiate[chords]')
+    audio = audiate.render("| Dm7 | G7 | Cmaj7 |", ingest={"style": "bossa", "tempo": 140})
+
     # register your own engine
     from audiate import register_engine
 
@@ -59,24 +62,29 @@ def render(
     engine: str = "auto",
     sample_rate: int = DFLT_SAMPLE_RATE,
     soundfont: str = None,
+    ingest: dict = None,
     **opts,
 ) -> AudioData:
     """Render a symbolic score to audio.
 
     Args:
         source: The score -- a ``pretty_midi.PrettyMIDI``, a ``music21`` stream,
-            MIDI ``bytes``, or a file path (``.mid``/MusicXML/ABC/``kern``/MEI).
+            MIDI ``bytes``, a file path (``.mid``/MusicXML/ABC/``kern``/MEI), or a
+            **chord chart** (iReal ``irealb://`` URL / ``| C | Am |`` / ChordPro)
+            when ``accompy`` is installed.
         engine: Synthesis engine name, or ``'auto'`` (default) which picks
             ``'fluidsynth'`` when a SoundFont is available, else ``'sine'``.
         sample_rate: Requested output sample rate in Hz (engines that control it
             honor it; an external tool may report its own rate back).
         soundfont: Path to a ``.sf2``/``.sf3`` SoundFont (for ``fluidsynth``).
+        ingest: Options for chord-chart ingest via ``accompy`` (e.g.
+            ``{"style": "bossa", "tempo": 140}``); ignored for other sources.
         **opts: Extra engine-specific options.
 
     Returns:
         An :class:`~audiate.base.AudioData`.
     """
-    pm = to_pretty_midi(source)
+    pm = to_pretty_midi(source, **(ingest or {}))
     name = _resolve_engine(engine, soundfont=soundfont)
     array, sr = engines[name](pm, sample_rate=sample_rate, soundfont=soundfont, **opts)
     return AudioData(

@@ -53,9 +53,13 @@ symbolic = [
 fluidsynth = [
     "pyFluidSynth>=1.3",
 ]
+chords = [
+    "accompy>=0.3",
+]
 all = [
     "music21>=8.0",
     "pyFluidSynth>=1.3",
+    "accompy>=0.3",
 ]
 test = [
     "pytest>=7.0",
