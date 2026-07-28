@@ -8,7 +8,7 @@ Humdrum-`kern`, MEI — and get back an audio waveform. One call:
 ```python
 import audiate
 
-audio = audiate.render("song.mid")            # -> AudioData
+audio = audiate.render("song.mid")  # -> AudioData
 audio.write("song.wav")
 ```
 
@@ -36,17 +36,19 @@ audio = audiate.render("bach.krn")
 
 # ...or from objects you already have
 import pretty_midi
+
 audio = audiate.render(pretty_midi.PrettyMIDI("song.mid"))
 
 from music21 import corpus
+
 audio = audiate.render(corpus.parse("bach/bwv66.6"))
 
 # The result is an AudioData
-audio.array            # float32 numpy waveform
-audio.sample_rate      # e.g. 44100
+audio.array  # float32 numpy waveform
+audio.sample_rate  # e.g. 44100
 audio.duration_seconds
-audio.to_wav_bytes()   # WAV bytes
-audio.write("out.wav") # write to disk
+audio.to_wav_bytes()  # WAV bytes
+audio.write("out.wav")  # write to disk
 ```
 
 ## How it works
@@ -79,7 +81,7 @@ otherwise falls back to `sine`.
 
 ```python
 audio = audiate.render("song.mid", engine="fluidsynth", soundfont="MyPiano.sf2")
-audio = audiate.render("score.musicxml", engine="musescore")   # highest fidelity
+audio = audiate.render("score.musicxml", engine="musescore")  # highest fidelity
 ```
 
 Register your own engine — it's an open registry:
@@ -87,10 +89,11 @@ Register your own engine — it's an open registry:
 ```python
 from audiate import register_engine
 
+
 @register_engine("my_synth")
 def my_synth(pm, *, sample_rate=44100, **opts):
     ...
-    return waveform, sample_rate   # (np.ndarray, int)
+    return waveform, sample_rate  # (np.ndarray, int)
 ```
 
 ## System dependencies

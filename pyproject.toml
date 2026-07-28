@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audiate"
-version = "0.0.1"
+version = "0.0.2"
 description = "Render a symbolic music score (MIDI, MusicXML, ABC, ...) to audio"
 readme = "README.md"
 requires-python = ">=3.10"
