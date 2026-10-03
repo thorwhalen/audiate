@@ -34,7 +34,17 @@ from audiate.ingest import to_pretty_midi
 Snap = Optional[Literal["downbeat", "beat"]]
 
 #: Extensions :func:`export` hands to the MuseScore CLI.
-_MUSESCORE_EXPORTS = {".musicxml", ".mxl", ".xml", ".pdf", ".wav", ".mp3", ".flac", ".png", ".mscz"}
+_MUSESCORE_EXPORTS = {
+    ".musicxml",
+    ".mxl",
+    ".xml",
+    ".pdf",
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".png",
+    ".mscz",
+}
 
 
 def _snap_times(pm, start: float, end: float, snap: Snap) -> tuple:
@@ -280,7 +290,9 @@ def export(source, path, *, musescore_bin: str = None, timeout: float = 600):
                 "mxl" if ext == ".mxl" else "musicxml", fp=str(path)
             )
             return path
-        raise RuntimeError(f"Exporting {ext!r} needs the MuseScore CLI ($AUDIATE_MUSESCORE).")
+        raise RuntimeError(
+            f"Exporting {ext!r} needs the MuseScore CLI ($AUDIATE_MUSESCORE)."
+        )
     finally:
         if os.path.exists(midi_path):
             os.remove(midi_path)
