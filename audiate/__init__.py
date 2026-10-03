@@ -22,6 +22,10 @@ Complex things possible::
     # a chord chart -> backing track (needs accompy: pip install 'audiate[chords]')
     audio = audiate.render("| Dm7 | G7 | Cmaj7 |", ingest={"style": "bossa", "tempo": 140})
 
+    # crop a score to its first minute (widened to bar lines), export notation
+    first = audiate.crop("theme.mid", 0, 60, snap="downbeat")
+    audiate.export(first, "theme_first_minute.musicxml")   # MuseScore or music21
+
     # register your own engine
     from audiate import register_engine
 
@@ -37,6 +41,7 @@ arrangement lives in ``accompy``.
 
 from audiate.base import AudioData
 from audiate.ingest import detect_format, to_pretty_midi
+from audiate.ops import crop, export
 from audiate.registry import engines, register_engine
 
 # Importing the synth module registers the built-in engines into ``engines``.
@@ -46,6 +51,8 @@ __all__ = [
     "render",
     "list_engines",
     "to_pretty_midi",
+    "crop",
+    "export",
     "detect_format",
     "AudioData",
     "engines",
