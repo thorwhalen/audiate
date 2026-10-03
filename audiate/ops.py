@@ -8,7 +8,8 @@ and cropping a MIDI file are the same call.
   timeline): notes that straddle a cut are clipped rather than dropped, the
   controller state in force at the start (volume, pan, sustain, pitch bend) is
   carried to time zero, and the tempo map, time signatures and key signatures
-  are shifted, so the cropped score still has the right bar lines. With
+  are shifted. A cut inside a bar opens with a short bar so later bar lines
+  stay where they were (when the cut is on a beat unit). With
   ``snap="downbeat"`` the cut points move outward to bar lines, which is what
   you want before turning the result into notation.
 - :func:`export` writes a score to ``.mid``, or through the MuseScore CLI to
@@ -74,6 +75,48 @@ def _shifted_tempo_map(pm, new, start: float, end: float) -> None:
     new._update_tick_to_time(max(t1 - t0, 1))
 
 
+#: Seconds below which a clipped note or a bar remainder counts as zero.
+_EPS = 1e-6
+
+
+def _cropped_time_signatures(pm, start: float, end: float) -> list:
+    """Time signatures for the window, with a partial first bar when cut mid-bar.
+
+    Moving the signature in force to time 0 would start a full bar at the cut.
+    When the cut falls inside a bar, on a whole number of the signature's
+    beat units before the next bar line, the window instead opens with a
+    short bar (``k/denominator``) and the original signature resumes at that
+    bar line, so every later bar line lands where it was. A cut that is not
+    on a beat unit keeps the plain shifted signatures (bar lines then start
+    at the cut); ``snap="downbeat"`` avoids the question.
+    """
+    import pretty_midi
+
+    def make(e, t):
+        return pretty_midi.TimeSignature(e.numerator, e.denominator, t)
+
+    shifted = _shift_meta(pm.time_signature_changes, start, end, make=make)
+    if not shifted or shifted[0].time > _EPS:
+        return shifted
+    downbeats = [float(t) for t in pm.get_downbeats()]
+    later = [t for t in downbeats if t > start + _EPS]
+    on_bar = any(abs(t - start) <= _EPS for t in downbeats)
+    if on_bar or not later or later[0] >= end - _EPS:
+        return shifted
+    first, next_bar = shifted[0], later[0]
+    unit_ticks = pm.resolution * 4 / first.denominator
+    units = (pm.time_to_tick(next_bar) - pm.time_to_tick(start)) / unit_ticks
+    k = round(units)
+    if k < 1 or abs(units - k) > 1e-3:
+        return shifted
+    resume_at = next_bar - start
+    rest = [e for e in shifted[1:]]
+    pickup = [pretty_midi.TimeSignature(k, first.denominator, 0.0)]
+    if not any(abs(e.time - resume_at) <= _EPS for e in rest):
+        pickup.append(make(first, resume_at))
+    return sorted(pickup + rest, key=lambda e: e.time)
+
+
 def _shift_meta(events, start: float, end: float, *, make):
     """Keep the event in force at ``start`` (moved to 0) and those inside."""
     before = [e for e in events if e.time <= start]
@@ -124,12 +167,7 @@ def crop(
 
     new = pretty_midi.PrettyMIDI(resolution=pm.resolution)
     _shifted_tempo_map(pm, new, start, end)
-    new.time_signature_changes = _shift_meta(
-        pm.time_signature_changes,
-        start,
-        end,
-        make=lambda e, t: pretty_midi.TimeSignature(e.numerator, e.denominator, t),
-    )
+    new.time_signature_changes = _cropped_time_signatures(pm, start, end)
     new.key_signature_changes = _shift_meta(
         pm.key_signature_changes,
         start,
@@ -146,8 +184,10 @@ def crop(
         out = pretty_midi.Instrument(inst.program, is_drum=inst.is_drum, name=inst.name)
         for n in inst.notes:
             inside = start <= n.start and n.end <= end
-            overlaps = n.end > start and n.start < end
-            if inside or (keep_straddling and overlaps):
+            # Clipped length must be positive (beyond float noise), or the
+            # note would vanish on write() and the counts would disagree.
+            overlaps = min(n.end, end) - max(n.start, start) > _EPS
+            if overlaps and (inside or keep_straddling):
                 out.notes.append(
                     pretty_midi.Note(
                         n.velocity,
@@ -213,6 +253,8 @@ def export(source, path, *, musescore_bin: str = None, timeout: float = 600):
     os.close(fd)
     try:
         pm.write(midi_path)
+        if path.exists():  # never mistake an earlier run's file for this one's
+            path.unlink()
         if exe:
             proc = subprocess.run(
                 [exe, "-o", str(path), midi_path],
