@@ -103,7 +103,9 @@ A singing voice needs one line of a score, not its audio: the vocal notes, each 
 ```python
 import audiate
 
-line = audiate.sung_line("song.musicxml")  # or "song.mid", "song.kar", MIDI bytes, a music21 stream
+line = audiate.sung_line(
+    "song.musicxml"
+)  # or "song.mid", "song.kar", MIDI bytes, a music21 stream
 [(n.start, n.dur, n.pitch, n.syllable, n.word, n.starts_word) for n in line][:2]
 # [(0.0, 0.5, 64, 'can', 'candle', True), (0.5, 0.5, 67, 'dle', 'candle', False)]
 ```
