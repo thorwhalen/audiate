@@ -57,6 +57,14 @@ def write_midi(path, *tracks, type=1):
     return path
 
 
+def rows(rows_, ndigits=6):
+    """Rows of numbers rounded (exact comparison of nested tuples, any pytest)."""
+    return [
+        tuple(round(float(x), ndigits) if isinstance(x, float) else x for x in row)
+        for row in rows_
+    ]
+
+
 def words(line):
     return [(n.word, n.starts_word) for n in line]
 
@@ -75,7 +83,7 @@ def test_midi_times_follow_the_tempo_map_like_the_render(tmp_path):
         melody([60, 62, 64, 65]) + lyric(0, "a") + lyric(TPB, "b"),
     )
     line = sung_line(path)
-    assert [(n.start, n.dur) for n in line] == pytest.approx(
+    assert rows([(n.start, n.dur) for n in line]) == rows(
         [(0.0, 0.5), (0.5, 0.5), (1.0, 1.0), (2.0, 1.0)]
     )
     rendered = sorted(
@@ -83,7 +91,7 @@ def test_midi_times_follow_the_tempo_map_like_the_render(tmp_path):
         for i in audiate.to_pretty_midi(str(path)).instruments
         for n in i.notes
     )
-    assert [(n.start, n.end) for n in line] == pytest.approx(rendered)
+    assert rows([(n.start, n.end) for n in line]) == rows(rendered)
     assert [n.pitch for n in line] == [60, 62, 64, 65]
 
 
@@ -473,7 +481,7 @@ def test_musicxml_syllables_ties_rests_and_melismas(tmp_path):
         + xml_note("D", 5)
     )
     line = sung_line(save(tmp_path, xml_score(("Voice", [m1, m2]), tempo_bpm=120)))
-    assert [(n.start, n.dur, n.pitch) for n in line] == pytest.approx(
+    assert rows([(n.start, n.dur, n.pitch) for n in line]) == rows(
         [
             (0.0, 0.5, 64),
             (0.5, 0.5, 67),
@@ -524,11 +532,11 @@ def test_one_voice_is_read_and_keeps_the_tempo(tmp_path):
     )
     path = save(tmp_path, xml_score(("Voice", [m]), tempo_bpm=60))
     line = sung_line(path)
-    assert [(n.start, n.pitch, n.word) for n in line] == pytest.approx(
+    assert rows([(n.start, n.pitch, n.word) for n in line]) == rows(
         [(0.0, 64, "sing"), (2.0, 67, "it")]
     )
     other = sung_line(path, voice=2)
-    assert [(n.start, n.pitch) for n in other] == pytest.approx(
+    assert rows([(n.start, n.pitch) for n in other]) == rows(
         [(0.0, 60), (1.0, 62), (2.0, 64)]
     )
     with pytest.raises(ValueError, match="No voice 3 "):
@@ -607,7 +615,7 @@ def test_midi_and_musicxml_of_one_melody_give_the_same_line(tmp_path):
         + lyric(2 * TPB, "light")
     )
     midi_line = sung_line(write_midi(tmp_path / "t.mid", events))
-    assert [(n.start, n.dur) for n in xml_line] == pytest.approx(
+    assert rows([(n.start, n.dur) for n in xml_line]) == rows(
         [(n.start, n.dur) for n in midi_line]
     )
     assert [(n.pitch, n.word, n.starts_word, n.syllable) for n in xml_line] == [
