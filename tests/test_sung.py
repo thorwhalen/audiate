@@ -280,7 +280,9 @@ def test_lyrics_on_the_conductor_track_and_on_several_tracks(tmp_path):
         melody([60, 62]),
         lyric(0, "la"),
     )
-    with pytest.raises(ValueError, match=r"tracks \[0, 2\] without notes"):
+    with pytest.raises(
+        ValueError, match=r"spread over several tracks \(track 0: 1, track 2: 1\)"
+    ):
         sung_line(ambiguous)
 
 
@@ -875,13 +877,23 @@ def test_an_elision_links_its_two_words(tmp_path):
     assert {n.word for n in line} == {"candle amen"}
 
 
-def test_the_lines_own_lyrics_come_before_a_words_track(tmp_path):
+def test_the_track_holding_most_lyrics_is_the_lyric_track(tmp_path):
     path = write_midi(
         tmp_path / "t.mid",
+        lyric(0, "Title"),
+        melody([60, 62, 64])
+        + lyric(0, "right")
+        + lyric(TPB, "ones")
+        + lyric(2 * TPB, "here"),
+    )
+    assert [n.word for n in sung_line(path)] == ["right", "ones", "here"]
+    even = write_midi(
+        tmp_path / "e.mid",
         lyric(0, "wrong") + lyric(TPB, "words"),
         melody([60, 62]) + lyric(0, "right") + lyric(TPB, "ones"),
     )
-    assert [n.word for n in sung_line(path)] == ["right", "ones"]
+    with pytest.raises(ValueError, match="spread over several tracks"):
+        sung_line(even)
 
 
 def test_two_lyrics_of_one_verse_on_a_chord_are_refused(tmp_path):
@@ -1119,3 +1131,164 @@ def test_notes_the_xml_and_music21_disagree_on_warn_when_marks_are_lost():
         _mark_notes(
             [m21note.Note("C4")], "1", xm, None, marks, stream.Measure(number=3)
         )
+
+
+# --------------------------------------------------------------------------- review of PR 3, round 3
+
+
+def harmony(root):
+    return f"<harmony><root><root-step>{root}</root-step></root><kind>major</kind></harmony>"
+
+
+def test_a_dense_accompaniment_meeting_every_lyric_is_not_the_melody(tmp_path):
+    words = "Hel- lo dear world how are you now".split()
+    lyrics = lyric(0, "My Song Title")
+    lyrics += sum((lyric(TPB + i * TPB, w) for i, w in enumerate(words)), [])
+    vocal = melody([64, 65, 66] * 2 + [64, 65], start=TPB)
+    arpeggio = melody([48, 52, 56, 60] * 4 + [48, 52], beats=0.5, channel=1)
+    path = write_midi(tmp_path / "t.mid", vocal + arpeggio + lyrics, type=0)
+    line = sung_line(path, on_stray_lyric="skip")
+    assert [n.pitch for n in line] == [64, 65, 66, 64, 65, 66, 64, 65]
+    assert [n.word for n in line][:3] == ["Hello", "Hello", "dear"]
+
+
+def test_two_lines_agreeing_alike_with_the_lyrics_are_the_callers_choice(tmp_path):
+    events = melody([64, 65, 66, 67]) + melody([48, 50, 52, 53], channel=1)
+    events += sum((lyric(i * TPB, w) for i, w in enumerate("a b c d".split())), [])
+    with pytest.raises(ValueError, match=r"not clear.*agrees 100%.*agrees 100%"):
+        sung_line(write_midi(tmp_path / "t.mid", events, type=0))
+
+
+def test_a_credit_on_an_instrument_track_is_not_the_lyrics(tmp_path):
+    words = text(0, "@TMy Song")
+    words += sum(
+        (
+            text(i * TPB, w)
+            for i, w in enumerate(
+                ["\\Twin", "kle ", "twin", "kle ", "/lit", "tle ", "star"]
+            )
+        ),
+        [],
+    )
+    path = write_midi(
+        tmp_path / "s.kar",
+        text(0, "@KMIDI KARAOKE FILE"),
+        words,
+        melody(range(60, 67)),
+        melody([40] * 4, beats=2, channel=1) + text(0, "Bass: J. Smith"),
+    )
+    line = sung_line(path)
+    assert [n.pitch for n in line] == list(range(60, 67))
+    assert line[0].word == "Twinkle"
+
+
+def test_one_stray_lyric_on_an_instrument_track_borrows_nothing(tmp_path):
+    vocal = melody([60, 62, 64]) + sum(
+        (lyric(i * TPB, w) for i, w in enumerate("do re mi".split())), []
+    )
+    bass = melody([40], beats=3, channel=1) + lyric(0, "oops")
+    path = write_midi(tmp_path / "t.mid", vocal, bass)
+    assert [n.word for n in sung_line(path)] == ["do", "re", "mi"]
+    assert [n.word for n in sung_line(path, track=1)] == [""]
+
+
+def test_a_non_numeric_lyric_number_keeps_its_extend(tmp_path):
+    m = (
+        xml_note("C", lyrics=[("part1verse1", "Ah", "single", True)])
+        + xml_note("D")
+        + xml_note("", rest=True)
+        + xml_note("F", lyrics=[("part1verse1", "men", "single")])
+    )
+    line = sung_line(save(tmp_path, xml_score(("Voice", [m]))))
+    assert [n.word for n in line] == ["Ah", "Ah", "men"]
+
+
+def test_a_lead_sheet_with_chord_symbols_keeps_extends_and_skips_cues(tmp_path):
+    m1 = harmony("C") + xml_note("C", lyric="Ah", extend=True) + xml_note("D")
+    m1 += harmony("F") + xml_note("", rest=True) + xml_note("F")
+    m2 = harmony("G") + xml_note("G", lyric="one") + xml_note("A", cue=True)
+    m2 += xml_note("B", lyric="two") + xml_note("C", 5, lyric="three")
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the XML and music21 agree on every note
+        line = sung_line(save(tmp_path, xml_score(("Lead", [m1, m2]))))
+    assert [(n.pitch, n.word) for n in line] == [
+        (60, "Ah"),
+        (62, "Ah"),
+        (65, "Ah"),
+        (67, "one"),
+        (71, "two"),
+        (72, "three"),
+    ]
+
+
+def test_a_verse_holding_its_word_is_not_borrowed_under_a_repeat(tmp_path):
+    m1 = FORWARD + xml_note(
+        "C", dur=2, lyrics=[(1, "Sing", "single"), (2, "Glo", "begin", True)]
+    )
+    m1 += xml_note("D", dur=2, lyrics=[(1, "we", "single")])
+    m2 = xml_note("E", dur=2, lyric="now") + xml_note("F", dur=2, lyric="and")
+    m3 = (
+        xml_note("G", dur=4, lyrics=[(1, "ever", "single"), (2, "ri", "end")])
+        + BACKWARD
+    )
+    line = sung_line(save(tmp_path, xml_score(("Voice", [m1, m2, m3]))))
+    assert [n.word for n in line][5:] == ["Glori"] * 5
+    assert [n.syllable for n in line][5:] == ["Glo", "", "", "", "ri"]
+
+
+def test_a_bar_lacking_the_pass_verse_borrows_by_pass_not_the_lowest(tmp_path):
+    m1 = FORWARD + xml_note(
+        "C", dur=4, lyrics=[(1, "a", "single"), (2, "b", "single"), (3, "c", "single")]
+    )
+    m2 = (
+        xml_note("D", dur=4, lyrics=[(1, "one", "single"), (3, "three", "single")])
+        + BACKWARD
+    )
+    line = sung_line(save(tmp_path, xml_score(("Voice", [m1, m2]))))
+    assert [n.word for n in line] == ["a", "one", "b", "three"]
+
+
+def test_verse_takes_a_lyric_lines_name(tmp_path):
+    m = xml_note("C", 4, 4, lyrics=[(1, "Verse", "single"), (1, "Chorus", "single")])
+    m = m.replace(
+        '<lyric number="1"><syllabic>single</syllabic><text>Chorus',
+        '<lyric number="1" name="chorus"><syllabic>single</syllabic><text>Chorus',
+    )
+    path = save(tmp_path, xml_score(("Voice", [m])))
+    assert [n.word for n in sung_line(path, verse="chorus")] == ["Chorus"]
+    with pytest.raises(ValueError, match=r"named lyric lines \['chorus'\]"):
+        sung_line(path, verse="bridge")
+
+
+def test_a_voice_missing_from_a_closed_score_bar_warns(tmp_path):
+    back = "<backup><duration>4</duration></backup>"
+    m1 = "".join(
+        xml_note(s, 5, voice=1, staff=1, lyric=w)
+        for s, w in zip("EFGA", ["God", "is", "love", "so"])
+    )
+    m1 += back + "".join(xml_note(s, 5, voice=2, staff=1) for s in "CDEF")
+    m1 += back + xml_note("G", 3, 4, voice=3, staff=2)
+    m2 = (
+        xml_note("G", 5, 4, voice=1, staff=1, lyric="true")
+        + back
+        + xml_note("C", 3, 4, voice=3, staff=2)
+    )
+    path = save(tmp_path, xml_score(("Choir", [m1, m2], 2)))
+    with pytest.warns(UserWarning, match="voice 2 is silent there"):
+        alto = sung_line(path, part=0, voice=2, with_lyrics=False)
+    assert [n.pitch for n in alto] == [72, 74, 76, 77]
+
+
+def test_a_grand_staff_piano_before_the_voice(tmp_path):
+    held = (
+        xml_note("C", voice=1, lyric="Ah", extend=True)
+        + xml_note("D", voice=1)
+        + xml_note("", rest=True, voice=1)
+        + xml_note("E", voice=1)
+    )
+    path = save(
+        tmp_path, xml_score(("Piano", [grand_staff_bar()], 2), ("Voice", [held]))
+    )
+    assert [n.word for n in sung_line(path, part="Voice")] == ["Ah", "Ah", "Ah"]

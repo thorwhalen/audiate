@@ -24,23 +24,35 @@ tempo marks of every part count, not only those of the sung part).
 This docstring is the one full statement of the reading rules; the function
 docstrings and the README point here.
 
+When the reader is not sure, it raises and names the choices (``track=``,
+``channel=``, ``part=``, ``voice=``, ``verse=``) rather than guess; a heuristic
+picks only with a clear margin.
+
 **Which line.** In a MIDI file, a line is one track and channel; drums (channel
-10) are skipped. With several candidates, the one whose track carries the
-lyrics is taken; else, among the lines the lyrics could belong to, the one
-whose note onsets meet the most lyrics; a tie is an error, and ``track=``
-(index in the file) and ``channel=`` (1 to 16) choose. In a music21 score, a
+10) are skipped. The lyric track is the one holding most of the file's sung
+texts (a credit or a stray event elsewhere is not lyrics; with no such track
+the lyrics are an error). With several candidate lines, the one on the lyric
+track is taken; else the one whose onsets agree best with the lyrics (lyrics
+met over the larger of the lyric and onset counts, so a dense accompaniment
+meeting every lyric scores low), when it scores ``LINE_MIN_SCORE`` and
+``LINE_MARGIN`` times the runner-up; otherwise ``track=`` (index in the file)
+and ``channel=`` (1 to 16) choose. In a music21 score, a
 line is one part (``part=``: an index, or a part name or id; a part on several
 staves is one part per staff), the one with lyrics by default, and one voice
 of it (``voice=``), the one with lyrics by default. Errors name the
 candidates. music21 forgets the voice of a one-voice bar, so it is read from
-the MusicXML: a bar of another voice is silent for the chosen one. Notes a bar
+the MusicXML: a bar of another voice is silent for the chosen one (with a
+warning: a closed score may mean unison). Chord symbols are no notes. Notes a bar
 holds outside its voices (a music21 stream built by hand) are sung with the
 default voice only.
 
 **Repeats** are played as the render plays them (music21's ``expandRepeats``:
 repeat barlines, voltas, D.C. and D.S.). On the n-th pass through a written
-bar, verse n is sung; a bar without verse n but with one verse only (a volta)
-sings that one, else the lowest. Badly formed repeats are an error naming the
+bar, verse n is sung. A bar without verse n sings another of its verses (the
+n-th of them, by pass) only in a volta or when verse n's last word is closed;
+while verse n holds a word open (a hyphen, an extend line) the bar is its
+melisma. ``verse=`` sings one verse throughout: a number, or a lyric line's
+name (MusicXML ``name``, or a non-numeric ``number``). Badly formed repeats are an error naming the
 bars (the render cannot play them either).
 
 **Polyphony is refused.** Two notes starting together (a chord, or a MIDI
@@ -121,6 +133,13 @@ DFLT_CHORD_WINDOW_S = 0.03
 DFLT_WORD_BREAK_REST_S = 0.2
 #: A MIDI lyric this many beats before a note's onset belongs to that note.
 LYRIC_LEAD_BEATS = 1 / 16
+#: The lyric track of a MIDI file holds more than this share of its sung texts.
+LYRIC_TRACK_MIN_SHARE = 0.5
+#: Several MIDI lines: the one whose onsets agree best with the lyrics is sung
+#: when its agreement is at least this...
+LINE_MIN_SCORE = 0.5
+#: ...and this many times the runner-up's; otherwise the caller chooses.
+LINE_MARGIN = 1.5
 #: A MIDI lyric inside a sounding note may be early for the next note by up to
 #: this many beats.
 LYRIC_EARLY_WINDOW_BEATS = 1 / 2
@@ -172,7 +191,7 @@ def sung_line(
     *,
     part: int | str | None = None,
     voice: int | str | None = None,
-    verse: int | None = None,
+    verse: int | str | None = None,
     track: int | None = None,
     channel: int | None = None,
     chords: Chords = "error",
@@ -192,8 +211,8 @@ def sung_line(
             the only part, else the only part with lyrics.
         voice: The voice of that part (its MusicXML voice number). Default: the
             only voice, else the only one with lyrics, else the first.
-        verse: The lyric verse (MusicXML lyric number) sung throughout. Default:
-            verse n on the n-th pass through a repeat, else the lowest.
+        verse: The lyric verse sung throughout: its MusicXML number, or a lyric
+            line's name. Default: verse n on the n-th pass (see the module doc).
         track: The MIDI track (index in the file). Default: see the module doc.
         channel: The MIDI channel, 1 to 16, for a track that mixes channels.
         chords: Two notes at once: ``"error"`` (default), or sing the
@@ -303,8 +322,15 @@ def sung_line_from_midi(
             for t, events in texts.items()
         }
     lead = round(mid.ticks_per_beat * LYRIC_LEAD_BEATS)
+    lyric_track = _lyric_track(sung_texts)
     (t, ch), raw = _pick_midi_line(
-        lines, sung_texts, track=track, channel=channel, name=name, lead=lead
+        lines,
+        sung_texts,
+        lyric_track,
+        track=track,
+        channel=channel,
+        name=name,
+        lead=lead,
     )
     pm = to_pretty_midi(data)  # the clock audiate.render plays the file on
 
@@ -325,8 +351,10 @@ def sung_line_from_midi(
     ]
     if not with_lyrics:
         return notes
+    if lyric_track == AMBIGUOUS:
+        raise ValueError(_spread_lyrics_message(sung_texts, name))
     note_tracks = {key[0] for key in lines}
-    events = _midi_lyric_events(sung_texts, t, note_tracks=note_tracks, name=name)
+    events = _midi_lyric_events(sung_texts, t, lyric_track, note_tracks=note_tracks)
     events = sorted(events, key=lambda e: e[0])  # stable: same-tick order kept
     syllables = _midi_syllables([text for _, text in events], karaoke=karaoke)
     on_note = _midi_lyrics_on_notes(
@@ -397,13 +425,47 @@ def _is_karaoke(name: str, texts: dict) -> bool:
     )
 
 
-def _pick_midi_line(lines, sung_texts, *, track, channel, name, lead):
+#: ``_lyric_track`` when no track holds most of the lyrics.
+AMBIGUOUS = -1
+
+
+def _word_counts(sung_texts) -> dict:
+    counts = {t: sum(1 for _, x in evs if x.strip()) for t, evs in sung_texts.items()}
+    return {t: c for t, c in counts.items() if c}
+
+
+def _lyric_track(sung_texts) -> Optional[int]:
+    """The track holding more than ``LYRIC_TRACK_MIN_SHARE`` of the file's sung
+    texts (a stray credit or event elsewhere is not lyrics), None if there are
+    none, ``AMBIGUOUS`` if no track holds that many."""
+    counts = _word_counts(sung_texts)
+    if not counts:
+        return None
+    t = max(counts, key=counts.get)
+    return t if counts[t] / sum(counts.values()) > LYRIC_TRACK_MIN_SHARE else AMBIGUOUS
+
+
+def _spread_lyrics_message(sung_texts, name) -> str:
+    counts = ", ".join(
+        f"track {t}: {c}" for t, c in sorted(_word_counts(sung_texts).items())
+    )
+    return (
+        f"{name}: the lyrics are spread over several tracks ({counts}) and none "
+        "holds most of them, so which are sung is not known: pass track= and "
+        "with_lyrics=False, and attach the words with attach_lyrics()"
+    )
+
+
+def _pick_midi_line(lines, sung_texts, lyric_track, *, track, channel, name, lead):
     """The one ``((track, channel), notes)`` that is the sung line, or an error
     naming the choices.
 
-    With several candidates: the one whose track carries the lyrics; else, among
-    those the lyrics could belong to, the one whose note onsets meet the most
-    lyrics (within ``lead`` ticks); a tie is an error.
+    With several candidates: the one on the lyric track; else, among those the
+    lyrics could belong to, the one whose onsets agree best with the lyrics
+    (lyrics met over the larger of the lyric and onset counts, so a dense
+    accompaniment meeting every lyric still scores low). A pick needs a score of
+    ``LINE_MIN_SCORE`` and ``LINE_MARGIN`` times the runner-up's; otherwise the
+    choice is the caller's, and the error lists the scores.
     """
     wanted = {
         key: notes
@@ -419,39 +481,35 @@ def _pick_midi_line(lines, sung_texts, *, track, channel, name, lead):
         )
     if len(wanted) == 1:
         return next(iter(wanted.items()))
-    worded = [key for key in wanted if _has_words(sung_texts, key[0])]
-    if len(worded) == 1:
-        return worded[0], wanted[worded[0]]
     note_tracks = {key[0] for key in lines}
-
-    def met(key):
-        try:
-            events = _midi_lyric_events(
-                sung_texts, key[0], note_tracks=note_tracks, name=name
+    scores: dict = {}
+    if lyric_track not in (None, AMBIGUOUS):
+        on_it = [key for key in wanted if key[0] == lyric_track]
+        if len(on_it) == 1:
+            return on_it[0], wanted[on_it[0]]
+        candidates = on_it or (wanted if lyric_track not in note_tracks else [])
+        ticks = [tick for tick, x in sung_texts[lyric_track] if x.strip()]
+        for key in candidates:
+            onsets = sorted({b for b, _, _ in wanted[key]})
+            met = sum(
+                bisect.bisect_right(onsets, tick + lead)
+                > bisect.bisect_left(onsets, tick - lead)
+                for tick in ticks
             )
-        except ValueError:
-            return 0
-        onsets = sorted(b for b, _, _ in wanted[key])
-        return sum(
-            bisect.bisect_right(onsets, tick + lead)
-            > bisect.bisect_left(onsets, tick - lead)
-            for tick, text in events
-            if text.strip()
-        )
-
-    scores = {key: met(key) for key in (worded or wanted)}
-    best = max(scores.values())
-    if best > 0 and list(scores.values()).count(best) == 1:
-        key = max(scores, key=scores.get)
-        return key, wanted[key]
+            scores[key] = met / max(len(ticks), len(onsets))
+        ranked = sorted(scores.values(), reverse=True) + [0.0]
+        if ranked[0] >= LINE_MIN_SCORE and ranked[0] >= LINE_MARGIN * ranked[1]:
+            key = max(scores, key=scores.get)
+            return key, wanted[key]
     choices = ", ".join(
         f"track={t} channel={c + 1} ({len(n)} notes"
-        f"{', lyrics on its track' if _has_words(sung_texts, t) else ''}"
-        f"{f', {scores[(t, c)]} lyrics on its onsets' if (t, c) in scores else ''})"
+        f"{', on the lyric track' if t == lyric_track else ''}"
+        f"{f', agrees {scores[(t, c)]:.0%} with the lyrics' if (t, c) in scores else ''})"
         for (t, c), n in sorted(wanted.items())
     )
     raise ValueError(
-        f"{name} has several lines; pick one (track=, channel=): {choices}"
+        f"{name} has several lines and which is sung is not clear; pick one "
+        f"(track=, channel=): {choices}"
     )
 
 
@@ -499,23 +557,16 @@ def _monophonic(raw, seconds, *, chords, chord_window_s, max_overlap_s, where):
 
 
 def _midi_lyric_events(
-    sung_texts, track: int, *, note_tracks, name
+    sung_texts, track: int, lyric_track, *, note_tracks
 ) -> list[tuple[int, str]]:
-    """The lyric events of the line's ``track``, else of the one track that has
-    lyrics and no notes (a conductor or words track). Lyrics on a track with notes
-    of its own belong to that track's line, never to another one."""
-    if _has_words(sung_texts, track):
-        return sung_texts[track]
-    others = sorted(
-        t for t in sung_texts if t not in note_tracks and _has_words(sung_texts, t)
-    )
-    if len(others) > 1:
-        raise ValueError(
-            f"{name}: the line (track {track}) has no lyrics of its own, and tracks "
-            f"{others} without notes have some: which are sung is not known, pass "
-            "with_lyrics=False"
-        )
-    return sung_texts[others[0]] if others else []
+    """The lyric events sung on the line of ``track``: those of the lyric track
+    when it is the line's own track or a track without notes (a conductor or
+    words track). Lyrics on another line's track are never borrowed."""
+    if lyric_track is None or lyric_track == AMBIGUOUS:
+        return []
+    if lyric_track == track or lyric_track not in note_tracks:
+        return sung_texts[lyric_track]
+    return []
 
 
 def _midi_syllables(
@@ -677,7 +728,7 @@ def sung_line_from_music21(
     *,
     part: int | str | None = None,
     voice: int | str | None = None,
-    verse: int | None = None,
+    verse: int | str | None = None,
     chords: Chords = "error",
     with_lyrics: bool = True,
     word_break_rest_s: float = DFLT_WORD_BREAK_REST_S,
@@ -764,12 +815,17 @@ def _merge_lyrics(earlier, later):
 
 def _tag_bars(score) -> None:
     """Number every bar of every part (``editorial['bar']``) before repeats are
-    expanded, so a bar's passes can be counted after (expansion renumbers bars)."""
+    expanded, so a bar's passes can be counted after (expansion renumbers bars),
+    and mark the bars under a volta bracket (``editorial['volta']``)."""
+    from music21 import spanner
     from music21 import stream as m21stream
 
     for p in list(getattr(score, "parts", None) or []) or [score]:
         for index, m in enumerate(p.getElementsByClass(m21stream.Measure)):
             m.editorial["bar"] = index
+            m.editorial["volta"] = any(
+                isinstance(s, spanner.RepeatBracket) for s in m.getSpannerSites()
+            )
 
 
 def _expand_repeats(score):
@@ -869,8 +925,8 @@ def _xml_bar_events(xml_measure, staff, *, forwards: bool) -> dict:
             by_voice.setdefault(v, []).append({"extend": set(), "cue": False})
             continue
         extend = {
-            int(ly.get("number") or 1)
-            for ly in child.findall("lyric")
+            _music21_lyric_number(ly, position)
+            for position, ly in enumerate(child.findall("lyric"), 1)
             if ly.find("extend") is not None and ly.find("extend").get("type") != "stop"
         }
         cue = child.find("cue") is not None
@@ -879,6 +935,21 @@ def _xml_bar_events(xml_measure, staff, *, forwards: bool) -> dict:
         else:
             by_voice.setdefault(v, []).append({"extend": extend, "cue": cue})
     return by_voice
+
+
+def _music21_lyric_number(xml_lyric, position: int) -> int:
+    """The number music21 gives a ``<lyric>``: its ``number`` when numeric, else
+    its position on the note (``number="part1verse1"`` is valid MusicXML)."""
+    number = (xml_lyric.get("number") or "").strip()
+    return int(number) if number.isdigit() else position
+
+
+def _notes_and_rests(stream) -> list:
+    """The notes, chords and rests of a stream, without chord symbols (music21
+    holds a ``<harmony>`` as a chord among the notes)."""
+    from music21 import harmony
+
+    return [e for e in stream.notesAndRests if not isinstance(e, harmony.Harmony)]
 
 
 def _annotate_from_musicxml(score, root) -> bool:
@@ -907,9 +978,9 @@ def _annotate_from_musicxml(score, root) -> bool:
             by_voice = _xml_bar_events(xm, staff, forwards=False)
             m.editorial["voices"] = sorted(by_voice)
             if m.voices:
-                groups = {str(v.id): list(v.notesAndRests) for v in m.voices}
+                groups = {str(v.id): _notes_and_rests(v) for v in m.voices}
             elif len(by_voice) == 1:
-                groups = {next(iter(by_voice)): list(m.notesAndRests)}
+                groups = {next(iter(by_voice)): _notes_and_rests(m)}
             else:
                 groups = {}
             for vid, elements in groups.items():
@@ -978,8 +1049,9 @@ def _pick_part(parts, part):
 
 def _voice_elements(line, voice, *, from_xml=False) -> list[tuple[float, Any, tuple]]:
     """``[(offset_in_quarters, note_or_rest_or_None, bar)]`` of one voice of a part,
-    in time order; ``bar`` is ``(pass, bar_index)`` (the pass counts the times the
-    same written bar was played before), None an element a silent bar of the voice.
+    in time order; ``bar`` is ``(pass, bar_index, in_volta)`` (the pass counts the
+    times the same written bar was played before), None an element a silent bar
+    of the voice. Chord symbols are no notes.
 
     A bar music21 holds without voices belongs to the voice the MusicXML gives
     it; a bar whose voice is not known (a music21 stream with several voices in
@@ -991,7 +1063,10 @@ def _voice_elements(line, voice, *, from_xml=False) -> list[tuple[float, Any, tu
     measures = list(line.getElementsByClass(m21stream.Measure))
     if not measures:
         return sorted(
-            ((float(el.offset), el, (0, 0)) for el in line.flatten().notesAndRests),
+            (
+                (float(el.offset), el, (0, 0, False))
+                for el in _notes_and_rests(line.flatten())
+            ),
             key=lambda x: x[0],
         )
     ids: list[str] = []
@@ -1004,7 +1079,7 @@ def _voice_elements(line, voice, *, from_xml=False) -> list[tuple[float, Any, tu
     seen: dict = {}
     for index, m in enumerate(measures):
         key = m.editorial.get("bar", index)
-        bar = (seen.get(key, 0), index)
+        bar = (seen.get(key, 0), index, bool(m.editorial.get("volta")))
         seen[key] = bar[0] + 1
         base = float(m.offset)
         if m.voices:
@@ -1012,12 +1087,14 @@ def _voice_elements(line, voice, *, from_xml=False) -> list[tuple[float, Any, tu
                 if str(v.id) == chosen:
                     out.extend(
                         (base + float(v.offset) + float(el.offset), el, bar)
-                        for el in v.notesAndRests
+                        for el in _notes_and_rests(v)
                     )
             if voice is None:  # notes held by the bar itself, outside its voices
                 out.extend(
                     (base + float(el.offset), el, bar)
-                    for el in m.getElementsByClass(("Note", "Chord", "Rest"))
+                    for el in _notes_and_rests(
+                        m.getElementsByClass(("Note", "Chord", "Rest")).stream()
+                    )
                 )
             continue
         bar_voices = m.editorial.get("voices")
@@ -1033,8 +1110,14 @@ def _voice_elements(line, voice, *, from_xml=False) -> list[tuple[float, Any, tu
             )
             bar_voices = [chosen]
         if chosen is None or chosen in bar_voices:
-            out.extend((base + float(el.offset), el, bar) for el in m.notesAndRests)
+            out.extend((base + float(el.offset), el, bar) for el in _notes_and_rests(m))
         else:
+            if any(not el.isRest for el in _notes_and_rests(m)):
+                warnings.warn(
+                    f"Bar {m.number} has only voice(s) {bar_voices}: voice {chosen} "
+                    "is silent there (if it sings in unison with them, the score "
+                    "does not say so)"
+                )
             out.append((base, None, bar))  # the voice is silent in this bar
     return sorted(out, key=lambda x: x[0])
 
@@ -1071,17 +1154,43 @@ def _sung_lyrics(el) -> list:
     ]
 
 
+def _matches_verse(lyric, verse) -> bool:
+    """A lyric is of ``verse``: its number, or (a string) its name or identifier."""
+    if isinstance(verse, str):
+        names = {str(lyric.identifier).casefold(), str(lyric.number)}
+        return verse.casefold() in names
+    return int(lyric.number) == verse
+
+
 def _verse_chooser(elements, verse) -> Optional[Callable]:
-    """``bar -> verse number``: ``verse`` throughout if given; else verse n on the
-    n-th pass through a bar when that bar has a verse n, else the bar's only verse,
-    else the lowest verse."""
+    """``bar -> verse``: ``verse`` throughout if given (a number, or a lyric
+    line's name); else verse n on the n-th pass through a bar. A bar without
+    verse n sings another of its verses only in a volta, or when verse n's last
+    word before the bar is closed; while verse n holds a word open (a hyphen, an
+    extend line) the bar's notes are its melisma."""
     numbers = sorted(
         {int(ly.number) for _, el, _ in elements if el for ly in _sung_lyrics(el)}
     )
     if verse is not None:
-        if verse not in numbers:
+        if not any(
+            _matches_verse(ly, verse)
+            for _, el, _ in elements
+            if el
+            for ly in _sung_lyrics(el)
+        ):
+            names = sorted(
+                {
+                    str(ly.identifier)
+                    for _, el, _ in elements
+                    if el
+                    for ly in _sung_lyrics(el)
+                    if ly.identifier is not None
+                    and str(ly.identifier) != str(ly.number)
+                }
+            )
             raise ValueError(
-                f"No verse {verse} in the sung line; its verses are {numbers}"
+                f"No verse {verse!r} in the sung line; its verses are {numbers}"
+                + (f", its named lyric lines {names}" if names else "")
             )
         return lambda bar: verse
     if not numbers:
@@ -1092,23 +1201,30 @@ def _verse_chooser(elements, verse) -> Optional[Callable]:
             in_bar.setdefault(bar, set()).update(
                 int(ly.number) for ly in _sung_lyrics(el)
             )
-
-    def verse_at(bar):
-        wanted = numbers[min(bar[0], len(numbers) - 1)]
-        here = in_bar.get(bar, set())
-        if wanted in here or not here:
-            return wanted
-        return next(iter(here)) if len(here) == 1 else min(here)
-
-    return verse_at
+    choice: dict = {}
+    open_word: dict = {}  # verse number -> its last word is still open
+    for _, el, bar in elements:
+        if bar not in choice:
+            wanted = numbers[min(bar[0], len(numbers) - 1)]
+            here = sorted(in_bar.get(bar, ()))
+            held = open_word.get(wanted, False) and not bar[2]
+            if wanted in here or not here or held:
+                choice[bar] = wanted
+            else:
+                choice[bar] = here[min(bar[0], len(here) - 1)]
+        for ly in _sung_lyrics(el) if el is not None else ():
+            last = (list(ly.components)[-1] if ly.isComposite else ly).syllabic
+            extend = int(ly.number) in (el.editorial.get("extend") or ())
+            open_word[int(ly.number)] = last in ("begin", "middle") or extend
+    return choice.get
 
 
 def _verse_lyric(element, verse):
     """``(text, first_syllabic, last_syllabic, extend)`` of the element's lyric in
     ``verse``, or None. Two of one verse on a chord (from two of its notes) is an
     error; on one note (music21 merges lyric lines that share a number but not a
-    name), the first is sung, with a warning."""
-    lyrics = [ly for ly in _sung_lyrics(element) if int(ly.number) == verse]
+    name), the first is sung, with a warning naming them."""
+    lyrics = [ly for ly in _sung_lyrics(element) if _matches_verse(ly, verse)]
     if len(lyrics) > 1:
         where = f"measure {element.measureNumber}"
         if getattr(element, "isChord", False):
@@ -1116,9 +1232,11 @@ def _verse_lyric(element, verse):
                 f"{len(lyrics)} lyrics of verse {verse} on one chord ({where}): keep "
                 "one, or pick a voice with voice="
             )
+        names = [str(ly.identifier) for ly in lyrics]
         warnings.warn(
             f"{len(lyrics)} lyrics numbered {verse} on one note ({where}): "
-            f"singing the first, {lyrics[0].text!r}"
+            f"singing the first, {lyrics[0].text!r}; their names are {names}, "
+            "which verse= also takes"
         )
     if not lyrics:
         return None
@@ -1127,7 +1245,7 @@ def _verse_lyric(element, verse):
     texts = [(p.text or "").strip() for p in parts]
     if not any(texts):
         return None
-    extend = verse in (element.editorial.get("extend") or ())
+    extend = int(lyric.number) in (element.editorial.get("extend") or ())
     return (
         " ".join(t for t in texts if t),
         parts[0].syllabic or "single",
