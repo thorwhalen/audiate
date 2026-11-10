@@ -1363,3 +1363,62 @@ def test_a_stutter_hyphen_does_not_turn_a_space_file_into_a_hyphen_file(tmp_path
         "love",
         "you",
     ]
+
+
+def test_the_reviewers_karaoke_shape_raises_naming_melody_and_harmony(tmp_path):
+    # Words on a note-less text track; the melody track plays a 64-eighth intro
+    # then the 24 sung notes; a harmony a third above sings only the sung notes;
+    # a chordal piano; drums on channel 10.
+    def harmony_line(sung):
+        return sum(
+            (note(t, t + TPB, 67 + k % 5, channel=1) for k, t in enumerate(sung)), []
+        )
+
+    def piano(sung):
+        return sum(
+            (
+                note(i * TPB, (i + 1) * TPB, p, channel=2)
+                for i in range(56)
+                for p in (48, 52, 55)
+            ),
+            [],
+        )
+
+    def drums(sung):
+        return sum((note(i * TPB, i * TPB + 100, 36, channel=9) for i in range(56)), [])
+
+    path = sung_after_intro(tmp_path, "m1.kar", harmony_line, piano, drums)
+    with pytest.raises(
+        ValueError, match=r"track=2 channel=1 \(88 notes.*track=3 channel=2 \(24 notes"
+    ) as e:
+        sung_line(path)
+    assert "channel=10" not in str(e.value)
+    melody_line = sung_line(path, track=2)
+    assert [n.pitch for n in melody_line[64:69]] == [64, 65, 66, 67, 68]
+    assert {n.word for n in melody_line if n.word} == {"Happy", "birthday", "to", "you"}
+
+
+@pytest.mark.parametrize("mark", ["\\", "/"])
+@pytest.mark.parametrize("kind", ["karaoke", "lyrics"])
+def test_a_line_mark_ends_the_word_before_it(tmp_path, mark, kind):
+    texts = ["Hap", "py ", "birth", "day ", "to ", "you", mark + "Hap", "py"]
+    events = melody(range(60, 68))
+    if kind == "karaoke":
+        events += sum((text(i * TPB, t) for i, t in enumerate(texts)), [])
+        tracks = [text(0, "@KMIDI KARAOKE FILE"), events]
+        name = "s.kar"
+    else:
+        events += sum((lyric(i * TPB, t) for i, t in enumerate(texts)), [])
+        tracks = [events]
+        name = "s.mid"
+    line = sung_line(write_midi(tmp_path / name, *tracks))
+    assert [n.word for n in line] == [
+        "Happy",
+        "Happy",
+        "birthday",
+        "birthday",
+        "to",
+        "you",
+        "Happy",
+        "Happy",
+    ]
