@@ -96,6 +96,24 @@ def my_synth(pm, *, sample_rate=44100, **opts):
     return waveform, sample_rate  # (np.ndarray, int)
 ```
 
+## The sung line: vocal notes with lyrics
+
+A singing voice needs one line of a score, not its audio: the vocal notes, each with its onset and duration in seconds, its MIDI pitch, the syllable sung on it and the word that syllable belongs to.
+
+```python
+import audiate
+
+line = audiate.sung_line("song.musicxml")  # or "song.mid", "song.kar", MIDI bytes, a music21 stream
+[(n.start, n.dur, n.pitch, n.syllable, n.word, n.starts_word) for n in line][:2]
+# [(0.0, 0.5, 64, 'can', 'candle', True), (0.5, 0.5, 67, 'dle', 'candle', False)]
+```
+
+- **Times** are on the same clock as `audiate.render`, so the line lines up with the rendered accompaniment. In a music21 score, a tempo mark in any part counts.
+- **The line**: in MIDI, one track and channel (drums skipped; the one whose track carries the lyrics when there are several; else pass `track=` and `channel=`). In MusicXML, one part (`part=`, an index or a name; default: the one with lyrics) and one voice (`voice=`). The error lists the candidates.
+- **Polyphony is refused**: notes starting together raise unless `chords="top"` or `"bottom"`; a MIDI overlap longer than `max_overlap_s` (0.1 s) raises, a shorter one is legato. Grace notes are skipped, tied notes merged.
+- **Lyrics**: MusicXML `<syllabic>` joins syllables into words, from one verse (`verse=`, default the lowest). MIDI reads `lyrics` meta events (hyphens join syllables; in files that mark word ends with spaces, so do unspaced syllables) and places each on the note sounding at its time, never by counting notes. Karaoke files (`.kar`) without lyric events are read from their text events, with the `/` and `\` line marks. A note without a syllable holds the word before it (a melisma) unless a rest came between.
+- `audiate.attach_lyrics(line, "Light a can-dle")` puts hand-written lyrics on the notes instead (read them with `with_lyrics=False`).
+
 ## System dependencies
 
 - **FluidSynth** (for the `fluidsynth` engine): `brew install fluid-synth` /
