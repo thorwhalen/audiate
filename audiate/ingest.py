@@ -4,7 +4,7 @@ MIDI is the universal pivot -- every supported symbolic format is read and
 converted to a ``PrettyMIDI`` object, which the synthesis engines consume. This
 gives N-ingesters x M-engines coverage from a small amount of code.
 
-- MIDI (``.mid`` / ``.midi`` / ``MThd`` bytes) is read directly by ``pretty_midi``.
+- MIDI (``.mid`` / ``.midi`` / ``.kar`` / ``MThd`` bytes) is read directly by ``pretty_midi``.
 - MusicXML / ABC / Humdrum-``kern`` / MEI and other notation formats go through
   ``music21`` (the ``audiate[symbolic]`` extra), which is the breadth champion
   for symbolic parsing.
@@ -25,7 +25,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-_MIDI_EXTS = {".mid", ".midi"}
+#: File extensions read as Standard MIDI Files (``.kar`` is karaoke MIDI).
+MIDI_EXTENSIONS = frozenset({".mid", ".midi", ".kar"})
 #: iReal Pro chord-chart URL schemes (unambiguous chord input).
 _IREAL_PREFIXES = ("irealb://", "irealbook://")
 #: A single chord symbol, e.g. C, F#m7, Bbmaj7, Dm7b5, G7/B, N.C.
@@ -42,6 +43,7 @@ _BEAT_GLYPHS = frozenset({"/", ".", "%", "x", "X", "-"})
 _EXT_FORMAT = {
     ".mid": "midi",
     ".midi": "midi",
+    ".kar": "midi",
     ".xml": "musicxml",
     ".musicxml": "musicxml",
     ".mxl": "musicxml",
@@ -187,7 +189,7 @@ def to_pretty_midi(source: Any, **ingest_opts):
     if _is_prettymidi(source):
         return source
     if _is_music21(source):
-        return _music21_to_pm(source)
+        return music21_to_pretty_midi(source)
     if isinstance(source, (bytes, bytearray)):
         b = bytes(source)
         if b[:4] == b"MThd":
@@ -205,7 +207,7 @@ def to_pretty_midi(source: Any, **ingest_opts):
                 )
             return _accompy_to_pm(p, **ingest_opts)
         ext = os.path.splitext(p)[1].lower()
-        if ext in _MIDI_EXTS:
+        if ext in MIDI_EXTENSIONS:
             return pretty_midi.PrettyMIDI(p)
         # Everything else -> music21 (it sniffs/handles many formats by extension).
         return _music21_parse_to_pm(p)
@@ -263,23 +265,47 @@ def _import_converter():
     return converter
 
 
-def _music21_parse_to_pm(source: Any):
+def parse_music21(source: Any):
+    """Parse a notation source with ``music21``: a path, notation text or file bytes.
+
+    A ``music21`` stream is returned as is. Needs the ``audiate[symbolic]`` extra.
+    """
+    if _is_music21(source):
+        return source
     converter = _import_converter()
     if isinstance(source, (bytes, bytearray)):
-        fd, tmp = tempfile.mkstemp()
+        fd, tmp = tempfile.mkstemp(suffix=_notation_suffix(bytes(source)))
         os.close(fd)
         with open(tmp, "wb") as f:
             f.write(bytes(source))
         try:
-            score = converter.parse(tmp)
+            return converter.parse(tmp)
         finally:
             _safe_remove(tmp)
-    else:
-        score = converter.parse(source)
-    return _music21_to_pm(score)
+    return converter.parse(source)
 
 
-def _music21_to_pm(stream):
+def _notation_suffix(data: bytes) -> str:
+    """The file extension music21 needs to read notation ``data`` (it reads by
+    extension): ``.mxl`` for a zip, ``.musicxml`` for MusicXML text, else none."""
+    if data[:2] == b"PK":
+        return ".mxl"
+    head = data[:2048].lstrip()
+    if b"<score-partwise" in head or b"<score-timewise" in head:
+        return ".musicxml"
+    return ""
+
+
+def _music21_parse_to_pm(source: Any):
+    return music21_to_pretty_midi(parse_music21(source))
+
+
+def music21_to_pretty_midi(stream):
+    """The ``pretty_midi.PrettyMIDI`` of a ``music21`` stream (through music21's MIDI writer).
+
+    This is the timeline every music21-read score is rendered on: its tempo map
+    (``tick_to_time``) turns the stream's quarter-length offsets into seconds.
+    """
     import pretty_midi
 
     fd, tmp = tempfile.mkstemp(suffix=".mid")

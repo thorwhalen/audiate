@@ -26,6 +26,10 @@ Complex things possible::
     first = audiate.crop("theme.mid", 0, 60, snap="downbeat")
     audiate.export(first, "theme_first_minute.musicxml")   # MuseScore or music21
 
+    # the sung line: vocal notes in seconds, with syllables and words
+    line = audiate.sung_line("song.musicxml")   # or a .mid / .kar file
+    [(n.start, n.dur, n.pitch, n.syllable, n.word) for n in line]
+
     # register your own engine
     from audiate import register_engine
 
@@ -42,6 +46,7 @@ arrangement lives in ``accompy``.
 from audiate.base import AudioData
 from audiate.ingest import detect_format, to_pretty_midi
 from audiate.ops import crop, export
+from audiate.sung import SungNote, attach_lyrics, sung_line
 from audiate.registry import engines, register_engine
 
 # Importing the synth module registers the built-in engines into ``engines``.
@@ -53,6 +58,9 @@ __all__ = [
     "to_pretty_midi",
     "crop",
     "export",
+    "sung_line",
+    "SungNote",
+    "attach_lyrics",
     "detect_format",
     "AudioData",
     "engines",

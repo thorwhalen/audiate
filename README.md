@@ -96,6 +96,22 @@ def my_synth(pm, *, sample_rate=44100, **opts):
     return waveform, sample_rate  # (np.ndarray, int)
 ```
 
+## The sung line: vocal notes with lyrics
+
+A singing voice needs one line of a score, not its audio: the vocal notes, each with its onset and duration in seconds, its MIDI pitch, the syllable sung on it and the word that syllable belongs to.
+
+```python
+import audiate
+
+line = audiate.sung_line("song.musicxml")  # or "song.mid", "song.kar", MIDI bytes, a music21 stream
+[(n.start, n.dur, n.pitch, n.syllable, n.word, n.starts_word) for n in line][:2]
+# [(0.0, 0.5, 64, 'can', 'candle', True), (0.5, 0.5, 67, 'dle', 'candle', False)]
+```
+
+The times are on the same clock as `audiate.render`, so the line lines up with the rendered accompaniment, repeats included. One line is read: a MIDI track and channel, or one part and voice of a MusicXML score; polyphony, ambiguous lyrics and unclear choices raise with the candidates named, and `part=`, `voice=`, `verse=`, `track=`, `channel=` and `chords=` choose. The full reading rules (which line, repeats and verses, syllables and words, melismas, karaoke) are in the docstring of `audiate.sung`.
+
+`audiate.attach_lyrics(line, "Light a can-dle")` puts hand-written lyrics on the notes instead (read them with `with_lyrics=False`).
+
 ## System dependencies
 
 - **FluidSynth** (for the `fluidsynth` engine): `brew install fluid-synth` /
