@@ -29,27 +29,37 @@ line is one part (``part=``: an index, or a part name or id), the one with
 lyrics by default, and one voice of it (``voice=``), the one with lyrics by
 default. Errors name the candidates.
 
+A bar the MusicXML gives to another voice is silent for the chosen one.
+Repeats are played as the render plays them (music21's ``expandRepeats``), and
+on the n-th pass through a bar, verse n is sung when the bar has one.
+
 **Polyphony is refused.** Two notes starting together (a chord, or a MIDI
-dyad) raise unless ``chords="top"`` or ``"bottom"`` picks one; a MIDI note
-overlapping the next by more than ``max_overlap_s`` raises (less is legato, and
-the note is cut at the next onset). Grace notes and zero-length notes are
-skipped; tied notes become one.
+dyad, within ``chord_window_s``) raise unless ``chords="top"`` or ``"bottom"``
+picks one; a MIDI note overlapping the next by more than ``max_overlap_s``
+raises (less is legato, and the note is cut at the next onset). Grace notes and
+zero-length notes are skipped, a lyric on one going to the next note; tied
+notes become one.
 
 **Lyrics.** MusicXML lyrics are read from the chosen verse (``verse=``, the
-lowest by default), syllables joined into words by ``<syllabic>`` (begin,
-middle, end); an elision (two syllables on one note) keeps both, separated by
-a space. MIDI lyrics come from ``lyrics`` meta events only, on the line's track,
-else on the one other track that has some; each goes to the note sounding at
-its tick (or starting a 64th note after it), never by counting, so a missing
-syllable cannot shift the ones after it. Syllables join into words by hyphens
-(``can-`` ``dle``, or ``can`` ``-dle``); when the file marks word ends with
-spaces (``Hel`` ``lo `` ``world``), a syllable not preceded by a space joins the
-one before. Karaoke files (``.kar``, or a ``@KMIDI KARAOKE FILE`` header) without
+lowest by default), syllables joined into words by ``<syllabic>`` (a
+``middle`` or ``end`` joins only a word a ``begin`` opened); an elision (two
+syllables on one note) keeps both, separated by a space. MIDI lyrics come from
+``lyrics`` meta events only, on the line's track, else on the one track that
+has lyrics and no notes (a conductor or words track). Each goes to its note by
+time, never by counting, so a missing syllable cannot shift the ones after it:
+the note starting within a 64th note of it, else the note sounding then, or
+the next one when the lyric is early for it (see ``_midi_lyrics_on_notes``).
+In a file that uses hyphens, hyphens alone join syllables (``can-`` ``dle``, or
+``can`` ``-dle``) and spaces only end words; in a hyphen-free file that marks
+word ends with spaces (``Hel`` ``lo `` ``world``), a syllable not preceded by a
+space joins the one before. Karaoke files (``.kar``, or a ``@KMIDI KARAOKE FILE`` header) without
 ``lyrics`` events are read from their ``text`` events the same way, with the
 ``/`` (new line) and ``\\`` (new paragraph) marks starting a word and ``@``
-header lines skipped; ``text`` events of any other file are never sung. A note
-without a syllable continues the word before it (a melisma), unless a rest
-came between.
+header lines skipped; ``text`` events of any other file are never sung.
+
+**Melismas.** A note without a syllable continues the word before it, unless a
+rest came between; a word left open (``can-``, a ``begin`` syllable) or a
+syllable with a MusicXML ``<extend/>`` line holds across rests too.
 
 :func:`attach_lyrics` puts a lyric line written by hand (``"Light a can-dle"``)
 on notes instead.
@@ -67,7 +77,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from audiate.ingest import (
     MIDI_EXTENSIONS,
@@ -76,6 +86,7 @@ from audiate.ingest import (
     detect_format,
     music21_to_pretty_midi,
     parse_music21,
+    to_pretty_midi,
 )
 
 Chords = Literal["error", "top", "bottom"]
@@ -85,16 +96,21 @@ DRUM_CHANNEL = 9
 #: A MIDI note may overlap the next by this much (legato) before the line counts
 #: as polyphonic.
 DFLT_MAX_OVERLAP_S = 0.1
+#: MIDI notes starting this close together (seconds) are one chord.
+DFLT_CHORD_WINDOW_S = 0.03
 #: A gap this long between notes is a rest: a note after it without a syllable
 #: of its own starts no word instead of holding the previous one (melisma).
 DFLT_WORD_BREAK_REST_S = 0.2
 #: A MIDI lyric this many beats before a note's onset belongs to that note.
 LYRIC_LEAD_BEATS = 1 / 16
+#: A MIDI lyric inside a sounding note may be early for the next note by up to
+#: this many beats.
+LYRIC_EARLY_WINDOW_BEATS = 1 / 2
 #: Lyric tokens that hold the previous syllable one more note (a melisma).
 HOLD_TOKENS = frozenset({"-", "_", "~"})
-#: A file marks word ends with spaces when at least this share of the gaps
-#: between its lyric texts has a space (or a karaoke mark) on either side; below
-#: it, a stray space is ignored and only hyphens join syllables.
+#: A hyphen-free file marks word ends with spaces when at least this share of
+#: the gaps between its lyric texts has a space (or a karaoke mark) on either
+#: side; below it, a stray space is ignored and every text is a word.
 SPACED_MIN_SHARE = 0.2
 #: Karaoke line marks at the start of a text event: new line, new paragraph.
 KARAOKE_MARKS = "/\\"
@@ -144,6 +160,7 @@ def sung_line(
     chords: Chords = "error",
     with_lyrics: bool = True,
     max_overlap_s: float = DFLT_MAX_OVERLAP_S,
+    chord_window_s: float = DFLT_CHORD_WINDOW_S,
     word_break_rest_s: float = DFLT_WORD_BREAK_REST_S,
 ) -> list[SungNote]:
     """The sung line of a score: its notes in seconds, with their syllables and words.
@@ -156,7 +173,8 @@ def sung_line(
             the only part, else the only part with lyrics.
         voice: The voice of that part (its MusicXML voice number). Default: the
             only voice, else the only one with lyrics, else the first.
-        verse: The lyric verse (MusicXML lyric number). Default: the lowest.
+        verse: The lyric verse (MusicXML lyric number) sung throughout. Default:
+            verse n on the n-th pass through a repeat, else the lowest.
         track: The MIDI track (index in the file). Default: see the module doc.
         channel: The MIDI channel, 1 to 16, for a track that mixes channels.
         chords: Two notes at once: ``"error"`` (default), or sing the
@@ -164,6 +182,8 @@ def sung_line(
         with_lyrics: False reads the notes only (every ``word`` empty).
         max_overlap_s: MIDI legato tolerance: a note overlapping the next by
             more than this is polyphony.
+        chord_window_s: MIDI notes starting this close together are one chord
+            (a played, slightly spread chord).
         word_break_rest_s: A gap this long is a rest, which ends a melisma.
 
     Returns:
@@ -189,6 +209,7 @@ def sung_line(
             chords=chords,
             with_lyrics=with_lyrics,
             max_overlap_s=max_overlap_s,
+            chord_window_s=chord_window_s,
             word_break_rest_s=word_break_rest_s,
         )
     _refuse_options("a music21 score", track=track, channel=channel)
@@ -214,7 +235,8 @@ def _is_midi(source: Any) -> bool:
 def _refuse_options(kind: str, **options) -> None:
     given = [name for name, value in options.items() if value is not None]
     if given:
-        raise ValueError(f"{', '.join(given)} do(es) not apply to {kind}")
+        verb = "does" if len(given) == 1 else "do"
+        raise ValueError(f"{' and '.join(given)} {verb} not apply to {kind}")
 
 
 def _check_chords(chords: str) -> None:
@@ -233,11 +255,11 @@ def sung_line_from_midi(
     chords: Chords = "error",
     with_lyrics: bool = True,
     max_overlap_s: float = DFLT_MAX_OVERLAP_S,
+    chord_window_s: float = DFLT_CHORD_WINDOW_S,
     word_break_rest_s: float = DFLT_WORD_BREAK_REST_S,
 ) -> list[SungNote]:
     """The sung line of a MIDI file (path or bytes); see :func:`sung_line`."""
     import mido
-    import pretty_midi
 
     _check_chords(chords)
     if channel is not None and not 1 <= channel <= 16:
@@ -247,7 +269,7 @@ def sung_line_from_midi(
     lines, lyrics, texts = _scan_midi(mid)
     sung_texts = lyrics
     karaoke = False
-    if not any(lyrics.values()) and _is_karaoke(name, texts):
+    if not _has_words(lyrics) and _is_karaoke(name, texts):
         karaoke = True
         sung_texts = {
             t: [(tick, text) for tick, text in events if not text.startswith("@")]
@@ -256,29 +278,39 @@ def sung_line_from_midi(
     (t, ch), raw = _pick_midi_line(
         lines, sung_texts, track=track, channel=channel, name=name
     )
-    pm = pretty_midi.PrettyMIDI(BytesIO(data))
+    pm = to_pretty_midi(data)  # the clock audiate.render plays the file on
 
     def seconds(tick: int) -> float:
         return float(pm.tick_to_time(int(tick)))
 
     where = f"track {t} channel {ch + 1} of {name}"
     spans = _monophonic(
-        raw, seconds, chords=chords, max_overlap_s=max_overlap_s, where=where
+        raw,
+        seconds,
+        chords=chords,
+        chord_window_s=chord_window_s,
+        max_overlap_s=max_overlap_s,
+        where=where,
     )
     notes = [
         SungNote(seconds(b), seconds(e) - seconds(b), pitch) for b, e, pitch in spans
     ]
     if not with_lyrics:
         return notes
-    events = sorted(_midi_lyric_events(sung_texts, t, name=name))
+    note_tracks = {key[0] for key in lines}
+    events = _midi_lyric_events(sung_texts, t, note_tracks=note_tracks, name=name)
+    events = sorted(events, key=lambda e: e[0])  # stable: same-tick order kept
     syllables = _midi_syllables([text for _, text in events], karaoke=karaoke)
     on_note = _midi_lyrics_on_notes(
         [(tick, s) for (tick, _), s in zip(events, syllables) if s is not None],
         [(b, e) for b, e, _ in spans],
         lead=round(mid.ticks_per_beat * LYRIC_LEAD_BEATS),
+        window=round(mid.ticks_per_beat * LYRIC_EARLY_WINDOW_BEATS),
         seconds=seconds,
     )
-    items = [(note, *on_note.get(i, (None, False))) for i, note in enumerate(notes)]
+    items = [
+        (note, *on_note.get(i, (None, False, False))) for i, note in enumerate(notes)
+    ]
     return _join_words(items, rest_s=word_break_rest_s)
 
 
@@ -296,7 +328,8 @@ def _scan_midi(mid):
 
     ``lines`` maps ``(track, channel)`` to ``[(begin_tick, end_tick, pitch)]``;
     ``lyrics`` and ``texts`` map a track to its ``[(tick, text)]`` ``lyrics`` and
-    ``text`` meta events. A note struck again before its note-off ends there.
+    ``text`` meta events, space-only ones included (they mark word ends). A note
+    struck again before its note-off ends there.
     """
     lines: dict = {}
     lyrics: dict = {}
@@ -306,7 +339,7 @@ def _scan_midi(mid):
         for msg in trk:
             tick += msg.time
             if msg.type in ("lyrics", "text"):
-                if msg.text.strip():
+                if msg.text:
                     target = lyrics if msg.type == "lyrics" else texts
                     target.setdefault(t, []).append((tick, msg.text))
                 continue
@@ -319,6 +352,12 @@ def _scan_midi(mid):
             if msg.type == "note_on" and msg.velocity > 0:
                 active[key] = tick
     return lines, lyrics, texts
+
+
+def _has_words(texts_by_track: dict, track: Optional[int] = None) -> bool:
+    """True if the (one ``track`` of the) map has a text that is not only spaces."""
+    tracks = texts_by_track if track is None else {track: texts_by_track.get(track)}
+    return any(text.strip() for events in tracks.values() for _, text in events or ())
 
 
 def _is_karaoke(name: str, texts: dict) -> bool:
@@ -346,12 +385,12 @@ def _pick_midi_line(lines, sung_texts, *, track, channel, name):
         )
     if len(wanted) == 1:
         return next(iter(wanted.items()))
-    worded = [key for key in wanted if sung_texts.get(key[0])]
+    worded = [key for key in wanted if _has_words(sung_texts, key[0])]
     if len(worded) == 1:
         return worded[0], wanted[worded[0]]
     choices = ", ".join(
         f"track={t} channel={c + 1} ({len(n)} notes"
-        f"{', lyrics on its track' if sung_texts.get(t) else ''})"
+        f"{', lyrics on its track' if _has_words(sung_texts, t) else ''})"
         for (t, c), n in sorted(wanted.items())
     )
     raise ValueError(
@@ -359,24 +398,36 @@ def _pick_midi_line(lines, sung_texts, *, track, channel, name):
     )
 
 
-def _monophonic(raw, seconds, *, chords, max_overlap_s, where):
-    """``[(begin, end, pitch)]`` of a one-voice line: notes starting together
-    resolved by ``chords``, legato overlaps cut at the next onset, polyphony refused."""
-    by_onset: dict = {}
-    for begin, end, pitch in raw:
-        ends = by_onset.setdefault(begin, {})
-        ends[pitch] = max(end, ends.get(pitch, end))  # a doubled note is one note
+def _monophonic(raw, seconds, *, chords, chord_window_s, max_overlap_s, where):
+    """``[(begin, end, pitch)]`` of a one-voice line.
+
+    Notes starting within ``chord_window_s`` of each other are a chord, resolved
+    by ``chords``; a doubled note (same pitch, same onset) is one note, as long
+    as its longest copy. Legato overlaps are cut at the next onset; longer ones
+    are polyphony.
+    """
+    groups: list[list] = []
+    for begin, end, pitch in sorted(raw):
+        if groups and seconds(begin) - seconds(groups[-1][0][0]) <= chord_window_s:
+            groups[-1].append((begin, end, pitch))
+        else:
+            groups.append([(begin, end, pitch)])
     spans = []
-    for begin in sorted(by_onset):
-        ends = by_onset[begin]
-        if len(ends) > 1 and chords == "error":
+    for group in groups:
+        by_pitch: dict = {}
+        for begin, end, pitch in group:
+            first = by_pitch.get(pitch)
+            by_pitch[pitch] = (
+                (begin, end) if first is None else (first[0], max(first[1], end))
+            )
+        if len(by_pitch) > 1 and chords == "error":
             raise ValueError(
-                f"{where} is polyphonic: {len(ends)} notes start at "
-                f"{seconds(begin):.2f} s. Pick a one-voice line, or pass "
+                f"{where} is polyphonic: {len(by_pitch)} notes start at "
+                f"{seconds(group[0][0]):.2f} s. Pick a one-voice line, or pass "
                 "chords='top' or 'bottom'"
             )
-        pitch = min(ends) if chords == "bottom" else max(ends)
-        spans.append([begin, ends[pitch], pitch])
+        pitch = min(by_pitch) if chords == "bottom" else max(by_pitch)
+        spans.append([*by_pitch[pitch], pitch])
     for here, following in zip(spans, spans[1:]):
         if here[1] > following[0]:
             overlap = seconds(here[1]) - seconds(following[0])
@@ -390,45 +441,64 @@ def _monophonic(raw, seconds, *, chords, max_overlap_s, where):
     return [tuple(s) for s in spans]
 
 
-def _midi_lyric_events(sung_texts, track: int, *, name) -> list[tuple[int, str]]:
-    """The lyric events of the line's ``track``, else of the one other track that
-    has some; several other tracks is an error (which one is sung?)."""
-    if sung_texts.get(track):
+def _midi_lyric_events(
+    sung_texts, track: int, *, note_tracks, name
+) -> list[tuple[int, str]]:
+    """The lyric events of the line's ``track``, else of the one track that has
+    lyrics and no notes (a conductor or words track). Lyrics on a track with notes
+    of its own belong to that track's line, never to another one."""
+    if _has_words(sung_texts, track):
         return sung_texts[track]
-    others = sorted(t for t, events in sung_texts.items() if events)
+    others = sorted(
+        t for t in sung_texts if t not in note_tracks and _has_words(sung_texts, t)
+    )
     if len(others) > 1:
         raise ValueError(
             f"{name}: the line (track {track}) has no lyrics of its own, and tracks "
-            f"{others} have some: pass track= for the line those lyrics belong to, "
-            "or with_lyrics=False"
+            f"{others} without notes have some: which are sung is not known, pass "
+            "with_lyrics=False"
         )
     return sung_texts[others[0]] if others else []
 
 
 def _midi_syllables(
     texts: Sequence[str], *, karaoke: bool = False
-) -> list[Optional[tuple[str, bool]]]:
-    """``(syllable, joins_the_previous_word)`` per MIDI lyric text, or None for a
-    text that is no syllable (a hold mark, a bare karaoke line mark).
+) -> list[Optional[tuple[str, bool, bool]]]:
+    """``(syllable, joins_the_previous_word, leaves_the_word_open)`` per MIDI lyric
+    text, or None for a text that is no syllable (spaces only, a hold mark, a bare
+    karaoke line mark).
 
-    Hyphens always join (``can-`` ``dle``, ``can`` ``-dle``). When the texts mark
-    word ends with spaces (or karaoke line marks), a syllable with no space or
-    mark before it joins the previous one too.
+    In a file that uses hyphens, hyphens alone join syllables (``can-`` ``dle``,
+    ``can`` ``-dle``) and spaces only end words. In a hyphen-free file whose texts
+    mark word ends with spaces, a syllable with no space before it (and none
+    after the one before) joins the previous one. Karaoke text always follows
+    the space convention, with ``/`` and ``\\`` starting a word.
 
     >>> _midi_syllables(["can-", "dle", "light"])
-    [('can', False), ('dle', True), ('light', False)]
+    [('can', False, True), ('dle', True, False), ('light', False, False)]
     >>> _midi_syllables(["Hel", "lo ", "world"])
-    [('Hel', False), ('lo', True), ('world', False)]
-    >>> _midi_syllables(["\\\\Twin", "kle ", "/Lit", "tle"], karaoke=True)
+    [('Hel', False, False), ('lo', True, False), ('world', False, False)]
+    >>> [s[0:2] for s in _midi_syllables(["Hap-", "py ", "birth-", "day ", "to"])]
+    [('Hap', False), ('py', True), ('birth', False), ('day', True), ('to', False)]
+    >>> [s[0:2] for s in _midi_syllables(["\\\\Twin", "kle ", "/Lit", "tle"], karaoke=True)]
     [('Twin', False), ('kle', True), ('Lit', False), ('tle', True)]
     """
+
+    def core_of(text):
+        return text.strip().lstrip(KARAOKE_MARKS).strip()
 
     def starts_apart(text):
         return text[:1].isspace() or text.lstrip()[:1] in tuple(KARAOKE_MARKS)
 
     gaps = len(texts) - 1
     boundaries = sum(
-        a[-1:].isspace() or starts_apart(b) for a, b in zip(texts, texts[1:])
+        a[-1:].isspace() or not a.strip() or starts_apart(b)
+        for a, b in zip(texts, texts[1:])
+    )
+    hyphenated = any(
+        core_of(t) not in HOLD_TOKENS
+        and (core_of(t).startswith("-") or core_of(t).endswith("-"))
+        for t in texts
     )
     if karaoke:
         if gaps > 0 and not boundaries:
@@ -440,58 +510,100 @@ def _midi_syllables(
             )
         spaced = True
     else:
-        spaced = gaps > 0 and boundaries / gaps >= SPACED_MIN_SHARE
+        spaced = not hyphenated and gaps > 0 and boundaries / gaps >= SPACED_MIN_SHARE
     out: list = []
     word_open = False  # the previous syllable asked for the next one (hyphen)
-    word_ended = True  # the previous text ended with a space or nothing came yet
+    word_ended = True  # a space or a mark came since the previous syllable
     for text in texts:
         stripped = text.lstrip()
-        mark = stripped[:1] in KARAOKE_MARKS and stripped[:1] != ""
+        mark = stripped[:1] != "" and stripped[:1] in KARAOKE_MARKS
         body = stripped.lstrip(KARAOKE_MARKS)
         lead_space = text[:1].isspace() or body[:1].isspace() or mark
         core = body.strip()
         if not core or core in HOLD_TOKENS:
             out.append(None)
-            if mark or text[-1:].isspace():
-                word_ended, word_open = True, False
+            if mark or not core or text[-1:].isspace():
+                word_ended = True
             continue
         syllable = core.strip("-").strip()
-        joins = bool(out) and (
+        joins = (
             core.startswith("-")
             or word_open
             or (spaced and not lead_space and not word_ended)
         )
-        out.append((syllable, joins) if syllable else None)
         word_open = core.endswith("-")
+        out.append((syllable, joins, word_open) if syllable else None)
         word_ended = text[-1:].isspace()
     return out
 
 
-def _midi_lyrics_on_notes(events, spans, *, lead, seconds) -> dict:
-    """``{note index: (syllable, joins)}``: each lyric on the note starting at its
-    tick or up to ``lead`` ticks after it, else on the note sounding at its tick.
+def _midi_lyrics_on_notes(events, spans, *, lead, window, seconds) -> dict:
+    """``{note index: (syllable, joins, open)}``: each lyric on its note.
 
-    A lyric on no note, or two on one, is an error rather than a word sung on the
-    wrong note.
+    A lyric belongs to the note starting at its tick or up to ``lead`` ticks
+    later, or starting up to ``lead`` ticks before it. Otherwise it falls inside
+    a sounding note and may be late for that note or early (up to ``window``
+    ticks) for the next one: the next one when the sounding note has its own
+    lyric, the sounding one when the next has its own, else the one it is
+    clearly nearer to; too close to call is an error. A lyric on no note, or two
+    on one, is an error rather than a word sung on the wrong note.
     """
     found: dict = {}
-    for tick, syllable in events:
-        i = next(
-            (k for k, (b, _) in enumerate(spans) if tick <= b <= tick + lead), None
-        )
-        if i is None:
-            i = next((k for k, (b, e) in enumerate(spans) if b <= tick < e), None)
-        if i is None:
-            raise ValueError(
-                f"The lyric {syllable[0]!r} at {seconds(tick):.2f} s falls on no note "
-                "of the line: fix the file, or pass with_lyrics=False"
-            )
+
+    def place(i, tick, syllable):
         if i in found:
             raise ValueError(
                 f"Two lyrics ({found[i][0]!r}, {syllable[0]!r}) on the note at "
                 f"{seconds(spans[i][0]):.2f} s: fix the file, or pass with_lyrics=False"
             )
         found[i] = syllable
+
+    pending = []
+    for tick, syllable in events:
+        i = next(
+            (k for k, (b, _) in enumerate(spans) if tick <= b <= tick + lead), None
+        )
+        if i is None:
+            i = next(
+                (
+                    k
+                    for k, (b, e) in enumerate(spans)
+                    if b <= tick <= b + lead and tick < e
+                ),
+                None,
+            )
+        if i is None:
+            pending.append((tick, syllable))
+        else:
+            place(i, tick, syllable)
+    for tick, syllable in pending:
+        sounding = next((k for k, (b, e) in enumerate(spans) if b <= tick < e), None)
+        upcoming = next(
+            (k for k, (b, _) in enumerate(spans) if tick < b <= tick + window), None
+        )
+        if sounding is None and upcoming is None:
+            raise ValueError(
+                f"The lyric {syllable[0]!r} at {seconds(tick):.2f} s falls on no note "
+                "of the line: fix the file, or pass with_lyrics=False"
+            )
+        if upcoming is None or sounding is None:
+            i = sounding if upcoming is None else upcoming
+        elif (sounding in found) != (upcoming in found):
+            i = upcoming if sounding in found else sounding
+        else:
+            late, early = tick - spans[sounding][0], spans[upcoming][0] - tick
+            if late >= 2 * early:
+                i = upcoming
+            elif early >= 2 * late:
+                i = sounding
+            else:
+                raise ValueError(
+                    f"The lyric {syllable[0]!r} at {seconds(tick):.2f} s could be late "
+                    f"for the note at {seconds(spans[sounding][0]):.2f} s or early for "
+                    f"the one at {seconds(spans[upcoming][0]):.2f} s: fix the file, or "
+                    "pass with_lyrics=False"
+                )
+        place(i, tick, syllable)
     return found
 
 
@@ -510,6 +622,8 @@ def sung_line_from_music21(
 ) -> list[SungNote]:
     """The sung line of a MusicXML file (or anything ``music21`` parses, or a
     ``music21`` stream); see :func:`sung_line`."""
+    from music21 import stream as m21stream
+
     _check_chords(chords)
     if (
         isinstance(source, (str, os.PathLike))
@@ -518,10 +632,14 @@ def sung_line_from_music21(
     ):
         raise FileNotFoundError(f"No score at {source}")
     score = parse_music21(source)
+    if not _is_music21(source):
+        _annotate_from_musicxml(score, _musicxml_root(source))
+    if score[m21stream.Measure]:  # as music21's MIDI writer does: repeats played
+        score = score.expandRepeats()
     parts = list(getattr(score, "parts", None) or []) or [score]
     chosen = _pick_part(parts, part)
     elements = _voice_elements(chosen.stripTies(), voice)
-    verse = _pick_verse(elements, verse) if with_lyrics else None
+    verse_at = _verse_chooser(elements, verse) if with_lyrics else None
     pm = music21_to_pretty_midi(score)
 
     def seconds(offset: float) -> float:
@@ -529,25 +647,26 @@ def sung_line_from_music21(
 
     items: list = []
     open_word = False
+    carried = None  # the lyric of a skipped (grace) note, sung on the next note
     previous_end = None
-    for offset, element in elements:
-        if element.isRest:
+    for offset, element, bar in elements:
+        if element is None or element.isRest:
             items.append(None)
             continue
+        lyric = _verse_lyric(element, verse_at(bar)) if verse_at else None
         length = float(element.duration.quarterLength)
-        if element.duration.isGrace or length <= 0:
-            continue
         pitches = [p.midi for p in getattr(element, "pitches", ())]
-        if not pitches:
+        if element.duration.isGrace or length <= 0 or not pitches:
+            carried = _merge_lyrics(carried, lyric)
             continue
-        if len(pitches) > 1:
-            if chords == "error":
-                raise ValueError(
-                    f"A chord in the sung line (measure {element.measureNumber}, "
-                    f"{seconds(offset):.2f} s): pass chords='top' or 'bottom', or "
-                    "voice= for a one-voice line"
-                )
-        pitch = max(pitches) if chords != "bottom" else min(pitches)
+        lyric, carried = _merge_lyrics(carried, lyric), None
+        if len(pitches) > 1 and chords == "error":
+            raise ValueError(
+                f"A chord in the sung line (measure {element.measureNumber}, "
+                f"{seconds(offset):.2f} s): pass chords='top' or 'bottom', or "
+                "voice= for a one-voice line"
+            )
+        pitch = min(pitches) if chords == "bottom" else max(pitches)
         if previous_end is not None and offset < previous_end - 1e-9:
             raise ValueError(
                 f"Overlapping notes in the sung line at {seconds(offset):.2f} s "
@@ -556,14 +675,101 @@ def sung_line_from_music21(
         previous_end = offset + length
         start, end = seconds(offset), seconds(offset + length)
         note = SungNote(start, end - start, int(pitch))
-        lyric = _verse_lyric(element, verse) if verse is not None else None
         if lyric is None:
-            items.append((note, None, False))
+            items.append((note, None, False, False))
             continue
-        text, first, last = lyric
-        items.append((note, text, first in ("middle", "end") or open_word))
+        text, first, last, extend = lyric
+        joins = open_word and first in ("middle", "end")
         open_word = last in ("begin", "middle")
+        items.append((note, text, joins, open_word or extend))
     return _join_words(items, rest_s=word_break_rest_s)
+
+
+def _merge_lyrics(earlier, later):
+    """One lyric from a skipped note's lyric and the next note's (either None)."""
+    if earlier is None or later is None:
+        return earlier or later
+    glue = "" if earlier[2] in ("begin", "middle") else " "
+    return (earlier[0] + glue + later[0], earlier[1], later[2], later[3])
+
+
+def _musicxml_root(source):
+    """The root element of a MusicXML document (path, bytes, text or ``.mxl``), or None."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    data = None
+    if isinstance(source, (bytes, bytearray)):
+        data = bytes(source)
+    elif isinstance(source, (str, os.PathLike)):
+        path = Path(source)
+        try:
+            if path.suffix.lower() in (".musicxml", ".xml", ".mxl") and path.exists():
+                data = path.read_bytes()
+        except OSError:  # notation text too long to be a path
+            data = None
+        if data is None and isinstance(source, str) and "<score-partwise" in source:
+            data = source.encode()
+    if not data:
+        return None
+    try:
+        if data[:2] == b"PK":
+            with zipfile.ZipFile(BytesIO(data)) as z:
+                names = [
+                    n
+                    for n in z.namelist()
+                    if n.lower().endswith((".xml", ".musicxml"))
+                    and not n.startswith("META-INF")
+                ]
+                data = z.read(names[0]) if names else b""
+        return ET.fromstring(data)
+    except (ET.ParseError, zipfile.BadZipFile, KeyError):
+        return None
+
+
+def _annotate_from_musicxml(score, root) -> None:
+    """Mark what music21 does not keep from the MusicXML: the voice number of each
+    bar (``editorial['voices']`` on the measure) and the lyric numbers with an
+    ``<extend/>`` line on each note (``editorial['extend']``)."""
+    from music21 import stream as m21stream
+
+    if root is None or root.tag != "score-partwise":
+        return
+    xml_parts = root.findall("part")
+    parts = list(getattr(score, "parts", []) or [])
+    if len(xml_parts) != len(parts):  # music21 keeps the parts in document order
+        return
+    for p, xml_part in zip(parts, xml_parts):
+        measures = list(p.getElementsByClass(m21stream.Measure))
+        if len(xml_part.findall("measure")) != len(measures):
+            continue
+        for m, xm in zip(measures, xml_part.findall("measure")):
+            by_voice: dict = {}
+            for xn in xm.findall("note"):
+                v = (xn.findtext("voice") or "1").strip()
+                extend = {
+                    int(ly.get("number") or 1)
+                    for ly in xn.findall("lyric")
+                    if ly.find("extend") is not None
+                    and ly.find("extend").get("type") != "stop"
+                }
+                if xn.find("chord") is not None and by_voice.get(v):
+                    by_voice[v][-1] |= extend
+                else:
+                    by_voice.setdefault(v, []).append(extend)
+            m.editorial["voices"] = sorted(by_voice)
+            if m.voices:
+                groups = {str(v.id): list(v.notesAndRests) for v in m.voices}
+            elif len(by_voice) == 1:
+                groups = {next(iter(by_voice)): list(m.notesAndRests)}
+            else:
+                groups = {}
+            for vid, elements in groups.items():
+                marks = by_voice.get(vid)
+                if marks is not None and len(marks) == len(elements):
+                    for element, extend in zip(elements, marks):
+                        if extend:
+                            element.editorial["extend"] = extend
 
 
 def _part_label(i: int, p) -> str:
@@ -608,41 +814,58 @@ def _pick_part(parts, part):
     return matches[0]
 
 
-def _voice_elements(line, voice) -> list[tuple[float, Any]]:
-    """``[(offset_in_quarters, note_or_rest)]`` of one voice of a part, in time order.
+def _voice_elements(line, voice) -> list[tuple[float, Any, tuple]]:
+    """``[(offset_in_quarters, note_or_rest_or_None, bar)]`` of one voice of a part,
+    in time order; ``bar`` is ``(pass, bar_index)`` (the pass counts the times a
+    repeated bar was played before), None an element a silent bar of the voice.
 
-    A measure with one voice gives its notes whatever ``voice`` is: that voice is
-    the line there.
+    A bar music21 holds without voices belongs to the voice the MusicXML gives
+    it; a bar whose voice is not known (a music21 stream with several voices in
+    other bars) is an error rather than another voice's notes sung.
     """
     from music21 import stream as m21stream
 
     measures = list(line.getElementsByClass(m21stream.Measure))
     if not measures:
         return sorted(
-            ((float(el.offset), el) for el in line.flatten().notesAndRests),
+            ((float(el.offset), el, (0, 0)) for el in line.flatten().notesAndRests),
             key=lambda x: x[0],
         )
-    ids = []
+    ids: list[str] = []
     for m in measures:
         for v in m.voices:
             if str(v.id) not in ids:
                 ids.append(str(v.id))
     chosen = _pick_voice(measures, ids, voice) if ids else None
     out = []
-    for m in measures:
+    seen: dict = {}
+    for index, m in enumerate(measures):
+        key = m.number  # expandRepeats renumbers a repeated bar 1 as 1a
+        bar = (seen.get(key, 0), index)
+        seen[key] = bar[0] + 1
+        base = float(m.offset)
         if m.voices:
             for v in m.voices:
                 if str(v.id) == chosen:
-                    base = float(m.offset) + float(v.offset)
-                    out.extend((base + float(el.offset), el) for el in v.notesAndRests)
-            out.extend(
-                (float(m.offset) + float(el.offset), el)
+                    out.extend(
+                        (base + float(v.offset) + float(el.offset), el, bar)
+                        for el in v.notesAndRests
+                    )
+            out.extend(  # notes held by the bar itself, outside its voices
+                (base + float(el.offset), el, bar)
                 for el in m.getElementsByClass(("Note", "Chord", "Rest"))
             )
-        else:
-            out.extend(
-                (float(m.offset) + float(el.offset), el) for el in m.notesAndRests
+            continue
+        bar_voices = m.editorial.get("voices")
+        if chosen is not None and bar_voices is None:
+            raise ValueError(
+                f"Bar {m.number} has one voice and others have several; which voice "
+                "it is is not known for a music21 stream: pass the MusicXML file"
             )
+        if chosen is None or chosen in (bar_voices or []):
+            out.extend((base + float(el.offset), el, bar) for el in m.notesAndRests)
+        else:
+            out.append((base, None, bar))  # the voice is silent in this bar
     return sorted(out, key=lambda x: x[0])
 
 
@@ -668,35 +891,60 @@ def _pick_voice(measures, ids, voice) -> str:
     )[0]
 
 
-def _pick_verse(elements, verse):
-    numbers = sorted(
-        {
+def _verse_chooser(elements, verse) -> Optional[Callable]:
+    """``bar -> verse number``: ``verse`` throughout if given; else verse n on the
+    n-th pass through a bar when that bar has a verse n, else the lowest verse."""
+
+    def numbers_of(el):
+        return {
             int(ly.number)
-            for _, el in elements
             for ly in getattr(el, "lyrics", ())
             if (ly.text or "").strip() or ly.isComposite
         }
-    )
-    if verse is None:
-        return numbers[0] if numbers else None
-    if verse not in numbers:
-        raise ValueError(f"No verse {verse} in the sung line; its verses are {numbers}")
-    return verse
+
+    numbers = sorted(set().union(*(numbers_of(el) for _, el, _ in elements if el)))
+    if verse is not None:
+        if verse not in numbers:
+            raise ValueError(
+                f"No verse {verse} in the sung line; its verses are {numbers}"
+            )
+        return lambda bar: verse
+    if not numbers:
+        return None
+    in_bar: dict = {}
+    for _, el, bar in elements:
+        if el is not None:
+            in_bar.setdefault(bar, set()).update(numbers_of(el))
+
+    def verse_at(bar):
+        wanted = numbers[min(bar[0], len(numbers) - 1)]
+        return wanted if wanted in in_bar.get(bar, ()) else numbers[0]
+
+    return verse_at
 
 
 def _verse_lyric(element, verse):
-    """``(text, first_syllabic, last_syllabic)`` of the element's lyric in ``verse``."""
-    lyric = next((ly for ly in element.lyrics if int(ly.number) == verse), None)
-    if lyric is None:
+    """``(text, first_syllabic, last_syllabic, extend)`` of the element's lyric in
+    ``verse``, or None; two lyrics of one verse on one note (a chord) is an error."""
+    lyrics = [ly for ly in element.lyrics if int(ly.number) == verse]
+    if len(lyrics) > 1:
+        raise ValueError(
+            f"{len(lyrics)} lyrics of verse {verse} on one chord (measure "
+            f"{element.measureNumber}): keep one, or pick a voice with voice="
+        )
+    if not lyrics:
         return None
+    lyric = lyrics[0]
     parts = list(lyric.components) if lyric.isComposite else [lyric]
     texts = [(p.text or "").strip() for p in parts]
     if not any(texts):
         return None
+    extend = verse in (element.editorial.get("extend") or ())
     return (
         " ".join(t for t in texts if t),
         parts[0].syllabic or "single",
         parts[-1].syllabic or "single",
+        extend,
     )
 
 
@@ -704,24 +952,26 @@ def _verse_lyric(element, verse):
 
 
 def _join_words(items: Iterable, *, rest_s: float) -> list[SungNote]:
-    """Notes with whole words, from ``(note, syllable, joins)`` items (``syllable``
-    None for a note without one) and None items (rests).
+    """Notes with whole words, from ``(note, syllable, joins, holds)`` items
+    (``syllable`` None for a note without one) and None items (rests).
 
     A syllable that ``joins`` continues the current word, even across a rest (the
-    score said so); a note without a syllable continues the current word as a
-    melisma, unless a rest (a None item, or a gap of ``rest_s``) came between.
+    score said so). A note without a syllable continues the current word as a
+    melisma, unless a rest (a None item, or a gap of ``rest_s``) came between it
+    and the word, and the word's last syllable does not hold across rests
+    (``holds``: a word left open by a hyphen, or a MusicXML ``<extend/>`` line).
     """
     notes: list[SungNote] = []
     word: list[int] = []
     parts: list[str] = []
-    can_hold, previous = False, None
+    can_hold, holds_over_rest, previous = False, False, None
     for item in items:
         if item is None:
-            can_hold = False
+            can_hold = can_hold and holds_over_rest
             continue
-        note, syllable, joins = item
+        note, syllable, joins, holds = item
         if previous is not None and note.start - previous.end >= rest_s - 1e-9:
-            can_hold = False
+            can_hold = can_hold and holds_over_rest
         if syllable is not None:
             starts = not (joins and word)
             if starts:
@@ -729,13 +979,14 @@ def _join_words(items: Iterable, *, rest_s: float) -> list[SungNote]:
             parts.append(syllable)
             notes.append(replace(note, syllable=syllable, starts_word=starts))
             word.append(len(notes) - 1)
-            can_hold = True
+            can_hold, holds_over_rest = True, holds
         elif word and can_hold:
             notes.append(replace(note, syllable="", starts_word=False))
             word.append(len(notes) - 1)
         else:
             notes.append(replace(note, word="", syllable="", starts_word=True))
             word, parts = [], []
+            can_hold = holds_over_rest = False
         if word:
             text = "".join(parts)
             for i in word:
