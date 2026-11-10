@@ -1155,7 +1155,7 @@ def test_a_dense_accompaniment_meeting_every_lyric_is_not_the_melody(tmp_path):
 def test_two_lines_agreeing_alike_with_the_lyrics_are_the_callers_choice(tmp_path):
     events = melody([64, 65, 66, 67]) + melody([48, 50, 52, 53], channel=1)
     events += sum((lyric(i * TPB, w) for i, w in enumerate("a b c d".split())), [])
-    with pytest.raises(ValueError, match=r"not clear.*agrees 100%.*agrees 100%"):
+    with pytest.raises(ValueError, match=r"not clear.*meets 100%.*meets 100%"):
         sung_line(write_midi(tmp_path / "t.mid", events, type=0))
 
 
@@ -1292,3 +1292,74 @@ def test_a_grand_staff_piano_before_the_voice(tmp_path):
         tmp_path, xml_score(("Piano", [grand_staff_bar()], 2), ("Voice", [held]))
     )
     assert [n.word for n in sung_line(path, part="Voice")] == ["Ah", "Ah", "Ah"]
+
+
+# --------------------------------------------------------------------------- review of PR 3, round 4
+
+
+def sung_after_intro(tmp_path, name, *others, type=1):
+    """A karaoke file: a words track, a melody with an instrumental intro, others."""
+    sung = [32 * TPB + i * TPB for i in range(24)]
+    words = ["\\Hap", "py ", "birth", "day ", "to ", "you"] * 4
+    intro = melody([72 + (i % 5) for i in range(64)], beats=0.5)
+    tune = sum((note(t, t + TPB, 64 + k % 5) for k, t in enumerate(sung)), [])
+    tracks = [
+        text(0, "@KMIDI KARAOKE FILE"),
+        sum((text(t, w) for t, w in zip(sung, words)), []),
+        intro + tune,
+        *(f(sung) for f in others),
+    ]
+    return write_midi(tmp_path / name, *tracks)
+
+
+def test_a_harmony_or_doubling_meeting_every_lyric_is_the_callers_choice(tmp_path):
+    def third_above(sung):
+        return sum(
+            (note(t, t + TPB, 67 + k % 5, channel=1) for k, t in enumerate(sung)), []
+        )
+
+    def octave_above(sung):
+        return sum(
+            (note(t, t + TPB, 76 + k % 5, channel=1) for k, t in enumerate(sung)), []
+        )
+
+    for maker in (third_above, octave_above):
+        path = sung_after_intro(tmp_path, f"{maker.__name__}.kar", maker)
+        with pytest.raises(
+            ValueError,
+            match=r"track=2 channel=1 .*meets 100%.*track=3 channel=2 .*meets 100%",
+        ):
+            sung_line(path)
+        assert sung_line(path, track=2)[64].pitch == 64
+
+
+def test_a_chordal_accompaniment_is_not_a_candidate_line(tmp_path):
+    def piano(sung):
+        beats = range(56)
+        return sum(
+            (
+                note(i * TPB, (i + 1) * TPB, p, channel=2)
+                for i in beats
+                for p in (48, 52, 55)
+            ),
+            [],
+        )
+
+    path = sung_after_intro(tmp_path, "p.kar", piano)
+    line = sung_line(path)
+    assert len(line) == 88 and line[64].word == "Happy" and line[64].pitch == 64
+
+
+def test_a_stutter_hyphen_does_not_turn_a_space_file_into_a_hyphen_file(tmp_path):
+    texts = ["Hap", "py ", "birth", "day ", "I- ", "I ", "love ", "you\r"]
+    line = sung_line(write_midi(tmp_path / "t.mid", lyric_line(texts)))
+    assert [n.word for n in line] == [
+        "Happy",
+        "Happy",
+        "birthday",
+        "birthday",
+        "I",
+        "I",
+        "love",
+        "you",
+    ]

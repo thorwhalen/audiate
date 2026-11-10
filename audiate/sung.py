@@ -32,10 +32,10 @@ picks only with a clear margin.
 10) are skipped. The lyric track is the one holding most of the file's sung
 texts (a credit or a stray event elsewhere is not lyrics; with no such track
 the lyrics are an error). With several candidate lines, the one on the lyric
-track is taken; else the one whose onsets agree best with the lyrics (lyrics
-met over the larger of the lyric and onset counts, so a dense accompaniment
-meeting every lyric scores low), when it scores ``LINE_MIN_SCORE`` and
-``LINE_MARGIN`` times the runner-up; otherwise ``track=`` (index in the file)
+track is taken; else, among the monophonic lines, the one whose onsets meet
+most of the lyrics, once lines far denser than the sparsest such line are set
+aside as accompaniment (see ``_pick_midi_line``). Two such lines (a harmony
+vocal, an octave doubling) or none is an error: ``track=`` (index in the file)
 and ``channel=`` (1 to 16) choose. In a music21 score, a
 line is one part (``part=``: an index, or a part name or id; a part on several
 staves is one part per staff), the one with lyrics by default, and one voice
@@ -76,10 +76,11 @@ the note starting within a 64th note of it, else the note sounding then, or
 the next one when the lyric is early for it (see ``_midi_lyrics_on_notes``).
 A lyric on no note (a title before the music) is an error, or skipped with
 ``on_stray_lyric="skip"``.
-In a file that uses hyphens, hyphens alone join syllables (``can-`` ``dle``, or
-``can`` ``-dle``) and spaces only end words; in a hyphen-free file that marks
-word ends with spaces (``Hel`` ``lo `` ``world``), a syllable not preceded by a
-space joins the one before. Karaoke files (``.kar``, or a ``@KMIDI KARAOKE FILE`` header) without
+A file follows the convention most of its lyrics follow: in a hyphen file,
+hyphens alone join syllables (``can-`` ``dle``, or ``can`` ``-dle``) and spaces
+only end words; in a space file (``Hel`` ``lo `` ``world``), a syllable not
+preceded by a space joins the one before, and a stray hyphen before a space (a
+stutter, ``I-`` ``I``) joins nothing (see ``_midi_syllables``). Karaoke files (``.kar``, or a ``@KMIDI KARAOKE FILE`` header) without
 ``lyrics`` events are read from their ``text`` events the same way, with the
 ``/`` (new line) and ``\\`` (new paragraph) marks starting a word and ``@``
 header lines skipped; ``text`` events of any other file are never sung.
@@ -135,11 +136,12 @@ DFLT_WORD_BREAK_REST_S = 0.2
 LYRIC_LEAD_BEATS = 1 / 16
 #: The lyric track of a MIDI file holds more than this share of its sung texts.
 LYRIC_TRACK_MIN_SHARE = 0.5
-#: Several MIDI lines: the one whose onsets agree best with the lyrics is sung
-#: when its agreement is at least this...
-LINE_MIN_SCORE = 0.5
-#: ...and this many times the runner-up's; otherwise the caller chooses.
-LINE_MARGIN = 1.5
+#: Several MIDI lines: a line may carry the lyrics if its onsets meet at least
+#: this share of them...
+LINE_MIN_RECALL = 0.8
+#: ...and it has at most this many times the onsets per lyric (over the lyrics'
+#: span) of the sparsest such line; a denser one is accompaniment.
+ACCOMPANIMENT_DENSITY = 1.5
 #: A MIDI lyric inside a sounding note may be early for the next note by up to
 #: this many beats.
 LYRIC_EARLY_WINDOW_BEATS = 1 / 2
@@ -331,6 +333,11 @@ def sung_line_from_midi(
         channel=channel,
         name=name,
         lead=lead,
+        is_polyphonic=_polyphony_test(
+            mid.ticks_per_beat,
+            chord_window_s=chord_window_s,
+            max_overlap_s=max_overlap_s,
+        ),
     )
     pm = to_pretty_midi(data)  # the clock audiate.render plays the file on
 
@@ -456,16 +463,19 @@ def _spread_lyrics_message(sung_texts, name) -> str:
     )
 
 
-def _pick_midi_line(lines, sung_texts, lyric_track, *, track, channel, name, lead):
+def _pick_midi_line(
+    lines, sung_texts, lyric_track, *, track, channel, name, lead, is_polyphonic
+):
     """The one ``((track, channel), notes)`` that is the sung line, or an error
     naming the choices.
 
-    With several candidates: the one on the lyric track; else, among those the
-    lyrics could belong to, the one whose onsets agree best with the lyrics
-    (lyrics met over the larger of the lyric and onset counts, so a dense
-    accompaniment meeting every lyric still scores low). A pick needs a score of
-    ``LINE_MIN_SCORE`` and ``LINE_MARGIN`` times the runner-up's; otherwise the
-    choice is the caller's, and the error lists the scores.
+    With several candidates: the one on the lyric track; else, among the
+    monophonic lines the lyrics could belong to, those meeting at least
+    ``LINE_MIN_RECALL`` of the lyrics with their onsets; of those, the ones
+    denser than ``ACCOMPANIMENT_DENSITY`` times the sparsest (onsets a lyric,
+    over the lyrics' span) are accompaniment. One left is the line; two (a
+    harmony vocal, an octave doubling) or none is the caller's choice, and the
+    error lists the figures.
     """
     wanted = {
         key: notes
@@ -488,7 +498,9 @@ def _pick_midi_line(lines, sung_texts, lyric_track, *, track, channel, name, lea
         if len(on_it) == 1:
             return on_it[0], wanted[on_it[0]]
         candidates = on_it or (wanted if lyric_track not in note_tracks else [])
-        ticks = [tick for tick, x in sung_texts[lyric_track] if x.strip()]
+        monophonic = [key for key in candidates if not is_polyphonic(wanted[key])]
+        candidates = monophonic or candidates
+        ticks = sorted(tick for tick, x in sung_texts[lyric_track] if x.strip())
         for key in candidates:
             onsets = sorted({b for b, _, _ in wanted[key]})
             met = sum(
@@ -496,21 +508,60 @@ def _pick_midi_line(lines, sung_texts, lyric_track, *, track, channel, name, lea
                 > bisect.bisect_left(onsets, tick - lead)
                 for tick in ticks
             )
-            scores[key] = met / max(len(ticks), len(onsets))
-        ranked = sorted(scores.values(), reverse=True) + [0.0]
-        if ranked[0] >= LINE_MIN_SCORE and ranked[0] >= LINE_MARGIN * ranked[1]:
-            key = max(scores, key=scores.get)
-            return key, wanted[key]
+            in_span = bisect.bisect_right(
+                onsets, ticks[-1] + lead
+            ) - bisect.bisect_left(onsets, ticks[0] - lead)
+            scores[key] = (met / len(ticks), in_span / len(ticks))
+        strong = {k: v for k, v in scores.items() if v[0] >= LINE_MIN_RECALL}
+        if strong:
+            sparsest = min(density for _, density in strong.values())
+            kept = [
+                k
+                for k, (_, density) in strong.items()
+                if density <= ACCOMPANIMENT_DENSITY * sparsest
+            ]
+            if len(kept) == 1:
+                return kept[0], wanted[kept[0]]
     choices = ", ".join(
         f"track={t} channel={c + 1} ({len(n)} notes"
         f"{', on the lyric track' if t == lyric_track else ''}"
-        f"{f', agrees {scores[(t, c)]:.0%} with the lyrics' if (t, c) in scores else ''})"
+        + (
+            f", meets {scores[(t, c)][0]:.0%} of the lyrics with "
+            f"{scores[(t, c)][1]:.1f} onsets a lyric"
+            if (t, c) in scores
+            else ""
+        )
+        + ")"
         for (t, c), n in sorted(wanted.items())
     )
     raise ValueError(
         f"{name} has several lines and which is sung is not clear; pick one "
         f"(track=, channel=): {choices}"
     )
+
+
+def _polyphony_test(ticks_per_beat, *, chord_window_s, max_overlap_s) -> Callable:
+    """``notes -> bool``: the line has chords or long overlaps (at 120 BPM, which
+    is enough to tell a piano part from a melody)."""
+
+    def seconds(tick):
+        return tick / ticks_per_beat / 2
+
+    def is_polyphonic(notes) -> bool:
+        try:
+            _monophonic(
+                notes,
+                seconds,
+                chords="error",
+                chord_window_s=chord_window_s,
+                max_overlap_s=max_overlap_s,
+                where="",
+            )
+        except ValueError:
+            return True
+        return False
+
+    return is_polyphonic
 
 
 def _monophonic(raw, seconds, *, chords, chord_window_s, max_overlap_s, where):
@@ -576,11 +627,17 @@ def _midi_syllables(
     text, or None for a text that is no syllable (spaces only, a hold mark, a bare
     karaoke line mark).
 
-    In a file that uses hyphens, hyphens alone join syllables (``can-`` ``dle``,
-    ``can`` ``-dle``) and spaces only end words. In a hyphen-free file whose texts
-    mark word ends with spaces, a syllable with no space before it (and none
-    after the one before) joins the previous one. Karaoke text always follows
-    the space convention, with ``/`` and ``\\`` starting a word.
+    A file follows the convention most of its texts follow. In a hyphen file,
+    hyphens alone join syllables (``can-`` ``dle``, ``can`` ``-dle``) and spaces
+    only end words. In a space file (more space-marked gaps than hyphens, and
+    at least as many as unmarked gaps; in a hyphen-free file, ``SPACED_MIN_SHARE``
+    of the gaps), a syllable with no space before it (and none after the one
+    before) joins the previous one, and a hyphen followed by a space (a stutter,
+    ``I-`` ``I``) ends the word. Karaoke text always follows the space
+    convention, with ``/`` and ``\\`` starting a word.
+
+    >>> [s[0] for s in _midi_syllables(["Hap", "py ", "birth", "day ", "I- ", "I ", "love "]) if s[1]]
+    ['py', 'day']
 
     >>> _midi_syllables(["can-", "dle", "light"])
     [('can', False, True), ('dle', True, False), ('light', False, False)]
@@ -598,16 +655,21 @@ def _midi_syllables(
     def starts_apart(text):
         return text[:1].isspace() or text.lstrip()[:1] in tuple(KARAOKE_MARKS)
 
+    def hyphen_gap(a, b):
+        ca, cb = core_of(a), core_of(b)
+        return (ca not in HOLD_TOKENS and ca.endswith("-")) or (
+            cb not in HOLD_TOKENS and cb.startswith("-")
+        )
+
     gaps = len(texts) - 1
-    boundaries = sum(
-        a[-1:].isspace() or not a.strip() or starts_apart(b)
-        for a, b in zip(texts, texts[1:])
+    pairs = list(zip(texts, texts[1:]))
+    spaces = sum(a[-1:].isspace() or not a.strip() or starts_apart(b) for a, b in pairs)
+    hyphens = sum(hyphen_gap(a, b) for a, b in pairs)
+    neither = gaps - sum(
+        hyphen_gap(a, b) or a[-1:].isspace() or not a.strip() or starts_apart(b)
+        for a, b in pairs
     )
-    hyphenated = any(
-        core_of(t) not in HOLD_TOKENS
-        and (core_of(t).startswith("-") or core_of(t).endswith("-"))
-        for t in texts
-    )
+    boundaries = spaces
     if karaoke:
         if gaps > 0 and not boundaries:
             raise NotImplementedError(
@@ -618,7 +680,14 @@ def _midi_syllables(
             )
         spaced = True
     else:
-        spaced = not hyphenated and gaps > 0 and boundaries / gaps >= SPACED_MIN_SHARE
+        # The convention the file mostly follows: a stray space in a hyphen file
+        # (line ends) or a stray hyphen in a space file (a stutter, "I- ") does
+        # not switch it. In a space file most word ends carry a space, so spaces
+        # outnumber the unmarked gaps (the joins inside words).
+        if hyphens:
+            spaced = spaces > hyphens and spaces >= neither
+        else:
+            spaced = gaps > 0 and spaces / gaps >= SPACED_MIN_SHARE
     out: list = []
     word_open = False  # the previous syllable asked for the next one (hyphen)
     word_ended = True  # a space or a mark came since the previous syllable
@@ -639,7 +708,8 @@ def _midi_syllables(
             or word_open
             or (spaced and not lead_space and not word_ended)
         )
-        word_open = core.endswith("-")
+        # In a space file a hyphen followed by a space ends the word ("I- I").
+        word_open = core.endswith("-") and not (spaced and text[-1:].isspace())
         out.append((syllable, joins, word_open) if syllable else None)
         word_ended = text[-1:].isspace()
     return out
