@@ -274,7 +274,7 @@ def parse_music21(source: Any):
         return source
     converter = _import_converter()
     if isinstance(source, (bytes, bytearray)):
-        fd, tmp = tempfile.mkstemp()
+        fd, tmp = tempfile.mkstemp(suffix=_notation_suffix(bytes(source)))
         os.close(fd)
         with open(tmp, "wb") as f:
             f.write(bytes(source))
@@ -283,6 +283,17 @@ def parse_music21(source: Any):
         finally:
             _safe_remove(tmp)
     return converter.parse(source)
+
+
+def _notation_suffix(data: bytes) -> str:
+    """The file extension music21 needs to read notation ``data`` (it reads by
+    extension): ``.mxl`` for a zip, ``.musicxml`` for MusicXML text, else none."""
+    if data[:2] == b"PK":
+        return ".mxl"
+    head = data[:2048].lstrip()
+    if b"<score-partwise" in head or b"<score-timewise" in head:
+        return ".musicxml"
+    return ""
 
 
 def _music21_parse_to_pm(source: Any):

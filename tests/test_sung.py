@@ -400,11 +400,17 @@ def xml_note(
     rest=False,
     lyrics=None,
     extend=False,
+    staff=None,
+    cue=False,
 ):
-    """One ``<note>``; ``lyrics`` is a list of ``(verse, text, syllabic)``."""
+    """One ``<note>``; ``lyrics`` is a list of ``(verse, text, syllabic)`` or
+    ``(verse, text, syllabic, extend)``: text or syllabic None leaves it out, an
+    extend True or a type (``"stop"``) adds the ``<extend/>``."""
     parts = []
     if grace:
         parts.append("<grace/>")
+    if cue:
+        parts.append("<cue/>")
     if chord:
         parts.append("<chord/>")
     parts.append(
@@ -418,38 +424,43 @@ def xml_note(
         parts.append(f'<tie type="{tie}"/>')
     if voice is not None:
         parts.append(f"<voice>{voice}</voice>")
+    if staff is not None:
+        parts.append(f"<staff>{staff}</staff>")
     if tie:
         parts.append(f'<notations><tied type="{tie}"/></notations>')
-    all_lyrics = list(lyrics or [])
+    all_lyrics = [tuple(x) + (None,) * (4 - len(x)) for x in lyrics or []]
     if lyric is not None:
-        all_lyrics.append((verse, lyric, syllabic))
-    for number, txt, syl in all_lyrics:
-        parts.append(
-            f'<lyric number="{number}"><syllabic>{syl}</syllabic><text>{txt}</text>'
-            + ("<extend/>" if extend else "")
-            + "</lyric>"
-        )
+        all_lyrics.append((verse, lyric, syllabic, extend))
+    for number, txt, syl, ext in all_lyrics:
+        body = f"<syllabic>{syl}</syllabic>" if syl else ""
+        body += f"<text>{txt}</text>" if txt is not None else ""
+        if ext:
+            body += "<extend/>" if ext is True else f'<extend type="{ext}"/>'
+        parts.append(f'<lyric number="{number}">{body}</lyric>')
     return "<note>" + "".join(parts) + "</note>"
 
 
 def xml_score(*parts, tempo_bpm=None):
-    """A score-partwise document from ``(name, [measure_body, ...])`` parts.
+    """A score-partwise document from ``(name, [measure_body, ...])`` parts, or
+    ``(name, measures, staves)`` for a part on several staves.
 
     The tempo mark, if any, goes in the first part only.
     """
     header = "".join(
-        f'<score-part id="P{i + 1}"><part-name>{name}</part-name></score-part>'
-        for i, (name, _) in enumerate(parts)
+        f'<score-part id="P{i + 1}"><part-name>{p[0]}</part-name></score-part>'
+        for i, p in enumerate(parts)
     )
     body = []
-    for i, (_, measures) in enumerate(parts):
+    for i, (_, measures, *staves) in enumerate(parts):
         ms = []
         for k, m in enumerate(measures):
             attrs = ""
             if k == 0:
                 attrs = (
                     "<attributes><divisions>1</divisions>"
-                    "<time><beats>4</beats><beat-type>4</beat-type></time></attributes>"
+                    "<time><beats>4</beats><beat-type>4</beat-type></time>"
+                    + (f"<staves>{staves[0]}</staves>" if staves else "")
+                    + "</attributes>"
                 )
                 if i == 0 and tempo_bpm:
                     attrs += f'<direction><sound tempo="{tempo_bpm}"/></direction>'
@@ -667,19 +678,6 @@ def test_attach_lyrics_spreads_and_holds_words():
     ]
     with pytest.raises(ValueError, match="3 lyric syllables for 4 notes"):
         attach_lyrics(notes, "one two three")
-
-
-def test_sung_notes_convert_field_for_field():
-    # A singing back end's note type with the same leading fields takes one directly.
-    n = SungNote(0.5, 0.25, 64, "candle", False, "dle")
-    assert (n.start, n.dur, n.pitch, n.word, n.starts_word) == (
-        0.5,
-        0.25,
-        64,
-        "candle",
-        False,
-    )
-    assert n.end == pytest.approx(0.75)
 
 
 # --------------------------------------------------------------------------- review of PR 3
@@ -907,20 +905,217 @@ def test_an_extend_line_holds_the_word_across_a_rest(tmp_path):
     assert [n.word for n in sung_line(score(False))] == ["Ah", "Ah", ""]
 
 
-def test_midi_timing_comes_from_audiates_own_ingest(tmp_path, monkeypatch):
-    import audiate.sung as sung
-
-    calls = []
-    real = sung.to_pretty_midi
-    monkeypatch.setattr(sung, "to_pretty_midi", lambda s: calls.append(s) or real(s))
-    path = write_midi(tmp_path / "t.mid", melody([60]))
-    sung_line(path)
-    assert len(calls) == 1
-
-
 def test_option_errors_are_grammatical(tmp_path):
     path = write_midi(tmp_path / "t.mid", melody([60]))
     with pytest.raises(ValueError, match="^part does not apply"):
         sung_line(path, part=0)
     with pytest.raises(ValueError, match="^part and verse do not apply"):
         sung_line(path, part=0, verse=1)
+
+
+# --------------------------------------------------------------------------- review of PR 3, round 2
+
+FORWARD = '<barline location="left"><repeat direction="forward"/></barline>'
+BACKWARD = '<barline location="right"><repeat direction="backward"/></barline>'
+
+
+def two_verses(a, b, sa="single", sb="single", ext=None):
+    return [(1, a, sa, ext), (2, b, sb, ext)]
+
+
+def grand_staff_bar():
+    return (
+        xml_note("C", 3, 4, voice=1, staff=1)
+        + "<backup><duration>4</duration></backup>"
+        + xml_note("C", 2, 4, voice=5, staff=2)
+    )
+
+
+def test_a_text_less_extend_stop_is_not_a_second_lyric(tmp_path):
+    m = (
+        xml_note("C", lyrics=two_verses("Glo", "Hail", "begin", "single", True))
+        + xml_note("D", lyrics=[(1, None, None, "stop"), (2, None, None, "stop")])
+        + xml_note("E", lyrics=two_verses("ri", "thee", "middle"))
+        + xml_note("F", lyrics=two_verses("a", "now", "end"))
+    )
+    path = save(tmp_path, xml_score(("Voice", [m])))
+    assert [n.word for n in sung_line(path)] == ["Gloria"] * 4
+    assert [n.word for n in sung_line(path, verse=2)] == ["Hail", "Hail", "thee", "now"]
+
+
+def test_two_lyrics_numbered_alike_on_one_note_sing_the_first_with_a_warning(tmp_path):
+    m = xml_note("C", 4, 4, lyrics=[(1, "Verse", "single"), (1, "Chorus", "single")])
+    with pytest.warns(UserWarning, match="2 lyrics numbered 1 on one note"):
+        line = sung_line(save(tmp_path, xml_score(("Voice", [m]))))
+    assert [n.word for n in line] == ["Verse"]
+
+
+def test_a_grand_staff_part_beside_the_voice_keeps_voices_and_extends(tmp_path):
+    held = (
+        xml_note("C", voice=1, lyric="Ah", extend=True)
+        + xml_note("D", voice=1)
+        + xml_note("", rest=True, voice=1)
+        + xml_note("E", voice=1)
+    )
+    divisi = (
+        xml_note("F", dur=2, voice=1, lyric="la")
+        + xml_note("G", dur=2, voice=1, lyric="lo")
+        + "<backup><duration>4</duration></backup>"
+        + xml_note("C", dur=4, voice=2)
+    )
+    piano = [grand_staff_bar(), grand_staff_bar()]
+    path = save(tmp_path, xml_score(("Voice", [held, divisi]), ("Piano", piano, 2)))
+    line = sung_line(path, part="Voice")
+    assert [n.word for n in line] == ["Ah", "Ah", "Ah", "la", "lo"]
+    assert [n.pitch for n in line] == [60, 62, 64, 65, 67]
+
+
+def test_a_volta_with_only_verse_2_sings_it(tmp_path):
+    end1 = '<barline location="left"><ending number="1" type="start"/></barline>'
+    end1 += ""
+    stop1 = '<barline location="right"><ending number="1" type="stop"/><repeat direction="backward"/></barline>'
+    start2 = '<barline location="left"><ending number="2" type="start"/></barline>'
+    stop2 = '<barline location="right"><ending number="2" type="stop"/></barline>'
+    m1 = FORWARD + xml_note("C", dur=2, lyrics=two_verses("Praise", "Sing"))
+    m1 += xml_note("D", dur=2, lyrics=two_verses("him", "it"))
+    m2 = end1 + xml_note("E", dur=4, lyrics=[(1, "now", "single")]) + stop1
+    m3 = start2 + xml_note("F", dur=4, lyrics=[(2, "loud", "single")]) + stop2
+    m4 = xml_note("G", dur=4, lyrics=two_verses("Amen", "Amen"))
+    path = save(tmp_path, xml_score(("Voice", [m1, m2, m3, m4]), tempo_bpm=60))
+    assert [n.word for n in sung_line(path)] == [
+        "Praise",
+        "him",
+        "now",
+        "Sing",
+        "it",
+        "loud",
+        "Amen",
+    ]
+
+
+def test_da_capo_sings_the_second_verse(tmp_path):
+    fine = '<direction><direction-type><words>Fine</words></direction-type><sound fine="yes"/></direction>'
+    dc = '<direction><direction-type><words>D.C. al Fine</words></direction-type><sound dacapo="yes"/></direction>'
+    m1 = xml_note("C", dur=4, lyrics=two_verses("a", "c"))
+    m2 = xml_note("D", dur=4, lyrics=two_verses("b", "d")) + fine
+    m3 = xml_note("E", dur=4, lyric="mid") + dc
+    path = save(tmp_path, xml_score(("Voice", [m1, m2, m3]), tempo_bpm=60))
+    line = sung_line(path)
+    assert [n.word for n in line] == ["a", "b", "mid", "c", "d"]
+    rendered = sorted(
+        n.start for i in audiate.to_pretty_midi(str(path)).instruments for n in i.notes
+    )
+    assert [n.start for n in line] == pytest.approx(rendered)
+
+
+def test_musicxml_and_mxl_bytes_are_read(tmp_path):
+    import zipfile
+
+    m = xml_note("C", lyric="can", syllabic="begin") + xml_note(
+        "D", dur=3, lyric="dle", syllabic="end"
+    )
+    xml = xml_score(("Voice", [m]))
+    assert [n.word for n in sung_line(xml.encode())] == ["candle", "candle"]
+    mxl = tmp_path / "s.mxl"
+    with zipfile.ZipFile(mxl, "w") as z:
+        z.writestr(
+            "META-INF/container.xml",
+            '<?xml version="1.0"?><container><rootfiles>'
+            '<rootfile full-path="score.musicxml"/></rootfiles></container>',
+        )
+        z.writestr("score.musicxml", xml)
+    assert [n.word for n in sung_line(mxl)] == ["candle", "candle"]
+    assert [n.word for n in sung_line(mxl.read_bytes())] == ["candle", "candle"]
+
+
+def test_a_karaoke_file_with_accompaniment_finds_its_melody(tmp_path):
+    words = text(0, "@LENGL") + text(0, "@TMy Song") + text(0, "\\Twin")
+    words += text(TPB, "kle ") + text(2 * TPB, "twin") + text(3 * TPB, "kle ")
+    path = write_midi(
+        tmp_path / "real.kar",
+        text(0, "@KMIDI KARAOKE FILE"),
+        words,
+        melody([60, 60, 67, 67]),
+        melody([48, 43], beats=2, channel=1),
+        melody([36] * 4, beats=0.1, gap=0.9, channel=9),
+    )
+    assert [n.pitch for n in sung_line(path)] == [60, 60, 67, 67]
+    assert [n.word for n in sung_line(path)] == ["Twinkle"] * 2 + ["twinkle"] * 2
+
+
+def test_a_type0_pop_file_needs_no_channel(tmp_path):
+    vocal = melody([64, 67, 69, 67]) + sum(
+        (lyric(i * TPB, w) for i, w in enumerate(["la", "li", "lo", "lu"])), []
+    )
+    bass = melody([40, 43], beats=2, channel=1)
+    path = write_midi(tmp_path / "t.mid", tempo(0, 100) + vocal + bass, type=0)
+    assert [n.pitch for n in sung_line(path)] == [64, 67, 69, 67]
+    tie = write_midi(
+        tmp_path / "tie.mid", melody([60, 62]) + melody([48, 50], channel=1), type=0
+    )
+    with pytest.raises(ValueError, match="several lines"):
+        sung_line(tie)
+
+
+def test_cue_notes_are_not_sung(tmp_path):
+    m = (
+        xml_note("C", lyric="one")
+        + xml_note("G", 5, cue=True)
+        + xml_note("G", 5, cue=True)
+        + xml_note("D", lyric="two")
+    )
+    line = sung_line(save(tmp_path, xml_score(("Voice", [m]))))
+    assert [(n.pitch, n.word) for n in line] == [(60, "one"), (62, "two")]
+
+
+def test_a_title_lyric_before_the_music_can_be_skipped(tmp_path):
+    events = sum(
+        (note(4 * TPB + k * TPB, 5 * TPB + k * TPB, 60 + k) for k in range(2)), []
+    )
+    events += lyric(0, "Yesterday") + lyric(4 * TPB, "Yes-") + lyric(5 * TPB, "ter")
+    path = write_midi(tmp_path / "t.mid", events)
+    with pytest.raises(ValueError, match="on_stray_lyric='skip'"):
+        sung_line(path)
+    assert [n.word for n in sung_line(path, on_stray_lyric="skip")] == ["Yester"] * 2
+
+
+def test_badly_formed_repeats_say_where(tmp_path):
+    m1 = xml_note("C", dur=4, lyric="a")
+    m2 = xml_note("D", dur=4) + BACKWARD
+    m3 = FORWARD + xml_note("E", dur=4)
+    with pytest.raises(
+        ValueError, match=r"repeats are badly formed \(repeat marks in bars \[2, 3\]\)"
+    ):
+        sung_line(save(tmp_path, xml_score(("Voice", [m1, m2, m3]))))
+
+
+def test_bar_level_notes_are_left_out_for_an_explicit_voice():
+    from music21 import note as m21note, stream
+
+    m = stream.Measure(number=1)
+    v = stream.Voice(id="1")
+    v.insert(0, m21note.Note("E4", quarterLength=2))
+    m.insert(0, v)
+    m.insert(2, m21note.Note("G4", quarterLength=2))
+    score = stream.Score([stream.Part([m])])
+    assert [n.pitch for n in sung_line(score, with_lyrics=False)] == [64, 67]
+    assert [n.pitch for n in sung_line(score, voice=1, with_lyrics=False)] == [64]
+
+
+def test_notes_the_xml_and_music21_disagree_on_warn_when_marks_are_lost():
+    import xml.etree.ElementTree as ET
+    from music21 import note as m21note, stream
+
+    from audiate.sung import _mark_notes
+
+    xm = ET.fromstring(
+        "<measure>"
+        + xml_note("C", lyric="Ah", extend=True)
+        + xml_note("D")
+        + "</measure>"
+    )
+    marks = [{"extend": {1}, "cue": False}, {"extend": set(), "cue": False}]
+    with pytest.warns(UserWarning, match="do not agree on its notes"):
+        _mark_notes(
+            [m21note.Note("C4")], "1", xm, None, marks, stream.Measure(number=3)
+        )

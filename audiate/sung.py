@@ -4,7 +4,7 @@ A singing backend needs a different view of a score than a synthesizer: one
 monophonic line of notes, each with its onset and duration in seconds, its MIDI
 pitch, the syllable sung on it, and where the words start and end.
 :func:`sung_line` reads that from a MIDI file or from anything ``music21`` reads
-(MusicXML first of all)::
+(MusicXML first of all), from a path, its bytes or a ``music21`` stream::
 
     >>> import audiate                                          # doctest: +SKIP
     >>> line = audiate.sung_line("song.musicxml")               # doctest: +SKIP
@@ -21,34 +21,49 @@ music21 offsets go through the same ``pretty_midi`` tempo map the render uses,
 so the sung line lines up with the rendered audio (for music21 scores, the
 tempo marks of every part count, not only those of the sung part).
 
+This docstring is the one full statement of the reading rules; the function
+docstrings and the README point here.
+
 **Which line.** In a MIDI file, a line is one track and channel; drums (channel
 10) are skipped. With several candidates, the one whose track carries the
-lyrics is taken; otherwise pass ``track=`` (index in the file) and, for a file
-that mixes channels in one track, ``channel=`` (1 to 16). In a music21 score, a
-line is one part (``part=``: an index, or a part name or id), the one with
-lyrics by default, and one voice of it (``voice=``), the one with lyrics by
-default. Errors name the candidates.
+lyrics is taken; else, among the lines the lyrics could belong to, the one
+whose note onsets meet the most lyrics; a tie is an error, and ``track=``
+(index in the file) and ``channel=`` (1 to 16) choose. In a music21 score, a
+line is one part (``part=``: an index, or a part name or id; a part on several
+staves is one part per staff), the one with lyrics by default, and one voice
+of it (``voice=``), the one with lyrics by default. Errors name the
+candidates. music21 forgets the voice of a one-voice bar, so it is read from
+the MusicXML: a bar of another voice is silent for the chosen one. Notes a bar
+holds outside its voices (a music21 stream built by hand) are sung with the
+default voice only.
 
-A bar the MusicXML gives to another voice is silent for the chosen one.
-Repeats are played as the render plays them (music21's ``expandRepeats``), and
-on the n-th pass through a bar, verse n is sung when the bar has one.
+**Repeats** are played as the render plays them (music21's ``expandRepeats``:
+repeat barlines, voltas, D.C. and D.S.). On the n-th pass through a written
+bar, verse n is sung; a bar without verse n but with one verse only (a volta)
+sings that one, else the lowest. Badly formed repeats are an error naming the
+bars (the render cannot play them either).
 
 **Polyphony is refused.** Two notes starting together (a chord, or a MIDI
 dyad, within ``chord_window_s``) raise unless ``chords="top"`` or ``"bottom"``
 picks one; a MIDI note overlapping the next by more than ``max_overlap_s``
-raises (less is legato, and the note is cut at the next onset). Grace notes and
-zero-length notes are skipped, a lyric on one going to the next note; tied
-notes become one.
+raises (less is legato, and the note is cut at the next onset). Grace notes, cue
+notes and zero-length notes are skipped, a lyric on one going to the next note;
+tied notes become one.
 
 **Lyrics.** MusicXML lyrics are read from the chosen verse (``verse=``, the
 lowest by default), syllables joined into words by ``<syllabic>`` (a
 ``middle`` or ``end`` joins only a word a ``begin`` opened); an elision (two
-syllables on one note) keeps both, separated by a space. MIDI lyrics come from
+syllables on one note) keeps both, separated by a space. Text-less lyrics (an
+``<extend type="stop"/>`` alone) are no lyric; two lyrics of one verse on a
+chord are an error, on one note (music21 merges lines that share a number but
+not a name) the first is sung, with a warning. MIDI lyrics come from
 ``lyrics`` meta events only, on the line's track, else on the one track that
 has lyrics and no notes (a conductor or words track). Each goes to its note by
 time, never by counting, so a missing syllable cannot shift the ones after it:
 the note starting within a 64th note of it, else the note sounding then, or
 the next one when the lyric is early for it (see ``_midi_lyrics_on_notes``).
+A lyric on no note (a title before the music) is an error, or skipped with
+``on_stray_lyric="skip"``.
 In a file that uses hyphens, hyphens alone join syllables (``can-`` ``dle``, or
 ``can`` ``-dle``) and spaces only end words; in a hyphen-free file that marks
 word ends with spaces (``Hel`` ``lo `` ``world``), a syllable not preceded by a
@@ -72,7 +87,9 @@ n.starts_word)`` converts one.
 
 from __future__ import annotations
 
+import bisect
 import os
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -90,6 +107,7 @@ from audiate.ingest import (
 )
 
 Chords = Literal["error", "top", "bottom"]
+StrayLyric = Literal["error", "skip"]
 
 #: MIDI channel 10 (index 9): percussion, never a sung line.
 DRUM_CHANNEL = 9
@@ -162,6 +180,7 @@ def sung_line(
     max_overlap_s: float = DFLT_MAX_OVERLAP_S,
     chord_window_s: float = DFLT_CHORD_WINDOW_S,
     word_break_rest_s: float = DFLT_WORD_BREAK_REST_S,
+    on_stray_lyric: StrayLyric = "error",
 ) -> list[SungNote]:
     """The sung line of a score: its notes in seconds, with their syllables and words.
 
@@ -185,6 +204,8 @@ def sung_line(
         chord_window_s: MIDI notes starting this close together are one chord
             (a played, slightly spread chord).
         word_break_rest_s: A gap this long is a rest, which ends a melisma.
+        on_stray_lyric: A MIDI lyric on no note of the line (a title before
+            the music): ``"error"`` (default) or ``"skip"`` it.
 
     Returns:
         The notes, in time order.
@@ -211,6 +232,7 @@ def sung_line(
             max_overlap_s=max_overlap_s,
             chord_window_s=chord_window_s,
             word_break_rest_s=word_break_rest_s,
+            on_stray_lyric=on_stray_lyric,
         )
     _refuse_options("a music21 score", track=track, channel=channel)
     return sung_line_from_music21(
@@ -257,11 +279,16 @@ def sung_line_from_midi(
     max_overlap_s: float = DFLT_MAX_OVERLAP_S,
     chord_window_s: float = DFLT_CHORD_WINDOW_S,
     word_break_rest_s: float = DFLT_WORD_BREAK_REST_S,
+    on_stray_lyric: StrayLyric = "error",
 ) -> list[SungNote]:
     """The sung line of a MIDI file (path or bytes); see :func:`sung_line`."""
     import mido
 
     _check_chords(chords)
+    if on_stray_lyric not in ("error", "skip"):
+        raise ValueError(
+            f"on_stray_lyric must be 'error' or 'skip', got {on_stray_lyric!r}"
+        )
     if channel is not None and not 1 <= channel <= 16:
         raise ValueError(f"channel is 1 to 16, got {channel}")
     data, name = _midi_data(source)
@@ -275,8 +302,9 @@ def sung_line_from_midi(
             t: [(tick, text) for tick, text in events if not text.startswith("@")]
             for t, events in texts.items()
         }
+    lead = round(mid.ticks_per_beat * LYRIC_LEAD_BEATS)
     (t, ch), raw = _pick_midi_line(
-        lines, sung_texts, track=track, channel=channel, name=name
+        lines, sung_texts, track=track, channel=channel, name=name, lead=lead
     )
     pm = to_pretty_midi(data)  # the clock audiate.render plays the file on
 
@@ -304,9 +332,10 @@ def sung_line_from_midi(
     on_note = _midi_lyrics_on_notes(
         [(tick, s) for (tick, _), s in zip(events, syllables) if s is not None],
         [(b, e) for b, e, _ in spans],
-        lead=round(mid.ticks_per_beat * LYRIC_LEAD_BEATS),
+        lead=lead,
         window=round(mid.ticks_per_beat * LYRIC_EARLY_WINDOW_BEATS),
         seconds=seconds,
+        stray=on_stray_lyric,
     )
     items = [
         (note, *on_note.get(i, (None, False, False))) for i, note in enumerate(notes)
@@ -368,9 +397,14 @@ def _is_karaoke(name: str, texts: dict) -> bool:
     )
 
 
-def _pick_midi_line(lines, sung_texts, *, track, channel, name):
+def _pick_midi_line(lines, sung_texts, *, track, channel, name, lead):
     """The one ``((track, channel), notes)`` that is the sung line, or an error
-    naming the choices."""
+    naming the choices.
+
+    With several candidates: the one whose track carries the lyrics; else, among
+    those the lyrics could belong to, the one whose note onsets meet the most
+    lyrics (within ``lead`` ticks); a tie is an error.
+    """
     wanted = {
         key: notes
         for key, notes in lines.items()
@@ -388,9 +422,32 @@ def _pick_midi_line(lines, sung_texts, *, track, channel, name):
     worded = [key for key in wanted if _has_words(sung_texts, key[0])]
     if len(worded) == 1:
         return worded[0], wanted[worded[0]]
+    note_tracks = {key[0] for key in lines}
+
+    def met(key):
+        try:
+            events = _midi_lyric_events(
+                sung_texts, key[0], note_tracks=note_tracks, name=name
+            )
+        except ValueError:
+            return 0
+        onsets = sorted(b for b, _, _ in wanted[key])
+        return sum(
+            bisect.bisect_right(onsets, tick + lead)
+            > bisect.bisect_left(onsets, tick - lead)
+            for tick, text in events
+            if text.strip()
+        )
+
+    scores = {key: met(key) for key in (worded or wanted)}
+    best = max(scores.values())
+    if best > 0 and list(scores.values()).count(best) == 1:
+        key = max(scores, key=scores.get)
+        return key, wanted[key]
     choices = ", ".join(
         f"track={t} channel={c + 1} ({len(n)} notes"
-        f"{', lyrics on its track' if _has_words(sung_texts, t) else ''})"
+        f"{', lyrics on its track' if _has_words(sung_texts, t) else ''}"
+        f"{f', {scores[(t, c)]} lyrics on its onsets' if (t, c) in scores else ''})"
         for (t, c), n in sorted(wanted.items())
     )
     raise ValueError(
@@ -537,7 +594,9 @@ def _midi_syllables(
     return out
 
 
-def _midi_lyrics_on_notes(events, spans, *, lead, window, seconds) -> dict:
+def _midi_lyrics_on_notes(
+    events, spans, *, lead, window, seconds, stray: str = "error"
+) -> dict:
     """``{note index: (syllable, joins, open)}``: each lyric on its note.
 
     A lyric belongs to the note starting at its tick or up to ``lead`` ticks
@@ -545,8 +604,9 @@ def _midi_lyrics_on_notes(events, spans, *, lead, window, seconds) -> dict:
     a sounding note and may be late for that note or early (up to ``window``
     ticks) for the next one: the next one when the sounding note has its own
     lyric, the sounding one when the next has its own, else the one it is
-    clearly nearer to; too close to call is an error. A lyric on no note, or two
-    on one, is an error rather than a word sung on the wrong note.
+    clearly nearer to; too close to call is an error. Two lyrics on one note is
+    an error rather than a word sung on the wrong note; so is a lyric on no note
+    (a title at the start, say), unless ``stray="skip"``.
     """
     found: dict = {}
 
@@ -582,9 +642,11 @@ def _midi_lyrics_on_notes(events, spans, *, lead, window, seconds) -> dict:
             (k for k, (b, _) in enumerate(spans) if tick < b <= tick + window), None
         )
         if sounding is None and upcoming is None:
+            if stray == "skip":
+                continue
             raise ValueError(
                 f"The lyric {syllable[0]!r} at {seconds(tick):.2f} s falls on no note "
-                "of the line: fix the file, or pass with_lyrics=False"
+                "of the line: pass on_stray_lyric='skip', or with_lyrics=False"
             )
         if upcoming is None or sounding is None:
             i = sounding if upcoming is None else upcoming
@@ -632,13 +694,15 @@ def sung_line_from_music21(
     ):
         raise FileNotFoundError(f"No score at {source}")
     score = parse_music21(source)
+    from_xml = False
     if not _is_music21(source):
-        _annotate_from_musicxml(score, _musicxml_root(source))
+        from_xml = _annotate_from_musicxml(score, _musicxml_root(source))
+    _tag_bars(score)
     if score[m21stream.Measure]:  # as music21's MIDI writer does: repeats played
-        score = score.expandRepeats()
+        score = _expand_repeats(score)
     parts = list(getattr(score, "parts", None) or []) or [score]
     chosen = _pick_part(parts, part)
-    elements = _voice_elements(chosen.stripTies(), voice)
+    elements = _voice_elements(chosen.stripTies(), voice, from_xml=from_xml)
     verse_at = _verse_chooser(elements, verse) if with_lyrics else None
     pm = music21_to_pretty_midi(score)
 
@@ -647,7 +711,7 @@ def sung_line_from_music21(
 
     items: list = []
     open_word = False
-    carried = None  # the lyric of a skipped (grace) note, sung on the next note
+    carried = None  # the lyric of a skipped (grace, cue) note, sung on the next note
     previous_end = None
     for offset, element, bar in elements:
         if element is None or element.isRest:
@@ -656,7 +720,12 @@ def sung_line_from_music21(
         lyric = _verse_lyric(element, verse_at(bar)) if verse_at else None
         length = float(element.duration.quarterLength)
         pitches = [p.midi for p in getattr(element, "pitches", ())]
-        if element.duration.isGrace or length <= 0 or not pitches:
+        if (
+            element.duration.isGrace
+            or element.editorial.get("cue")
+            or length <= 0
+            or not pitches
+        ):
             carried = _merge_lyrics(carried, lyric)
             continue
         lyric, carried = _merge_lyrics(carried, lyric), None
@@ -693,6 +762,38 @@ def _merge_lyrics(earlier, later):
     return (earlier[0] + glue + later[0], earlier[1], later[2], later[3])
 
 
+def _tag_bars(score) -> None:
+    """Number every bar of every part (``editorial['bar']``) before repeats are
+    expanded, so a bar's passes can be counted after (expansion renumbers bars)."""
+    from music21 import stream as m21stream
+
+    for p in list(getattr(score, "parts", None) or []) or [score]:
+        for index, m in enumerate(p.getElementsByClass(m21stream.Measure)):
+            m.editorial["bar"] = index
+
+
+def _expand_repeats(score):
+    from music21 import repeat as m21repeat
+
+    try:
+        return score.expandRepeats()
+    except m21repeat.ExpanderException as e:
+        bars = sorted(
+            {
+                getattr(r.getContextByClass("Measure"), "number", None)
+                for r in score.recurse().getElementsByClass(
+                    ("Repeat", "RepeatExpression")
+                )
+            }
+            - {None}
+        )
+        raise ValueError(
+            f"The score's repeats are badly formed (repeat marks in bars {bars}): "
+            "music21 cannot expand them, so audiate.render cannot play it either. "
+            "Fix the repeats, or remove them"
+        ) from e
+
+
 def _musicxml_root(source):
     """The root element of a MusicXML document (path, bytes, text or ``.mxl``), or None."""
     import xml.etree.ElementTree as ET
@@ -714,49 +815,96 @@ def _musicxml_root(source):
         return None
     try:
         if data[:2] == b"PK":
-            with zipfile.ZipFile(BytesIO(data)) as z:
-                names = [
-                    n
-                    for n in z.namelist()
-                    if n.lower().endswith((".xml", ".musicxml"))
-                    and not n.startswith("META-INF")
-                ]
-                data = z.read(names[0]) if names else b""
+            data = _mxl_rootfile(zipfile.ZipFile(BytesIO(data)))
         return ET.fromstring(data)
-    except (ET.ParseError, zipfile.BadZipFile, KeyError):
+    except (ET.ParseError, zipfile.BadZipFile, KeyError, IndexError):
         return None
 
 
-def _annotate_from_musicxml(score, root) -> None:
-    """Mark what music21 does not keep from the MusicXML: the voice number of each
-    bar (``editorial['voices']`` on the measure) and the lyric numbers with an
-    ``<extend/>`` line on each note (``editorial['extend']``)."""
+def _mxl_rootfile(z) -> bytes:
+    """The score of a compressed MusicXML (``.mxl``) archive: the container's
+    rootfile, else its first XML file outside ``META-INF``."""
+    import xml.etree.ElementTree as ET
+
+    with z:
+        try:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            return z.read(next(container.iter("rootfile")).get("full-path"))
+        except (KeyError, StopIteration, ET.ParseError):
+            names = [
+                n
+                for n in z.namelist()
+                if n.lower().endswith((".xml", ".musicxml"))
+                and not n.startswith("META-INF")
+            ]
+            return z.read(names[0])
+
+
+def _xml_staves(root) -> list:
+    """``[(xml_part, staff)]`` in music21's part order: a part with ``<staves>``
+    N becomes N parts (PartStaffs), one per staff (staff None: a one-staff part)."""
+    out = []
+    for xml_part in root.findall("part"):
+        staves = max(
+            [int(s.text) for s in xml_part.iter("staves") if (s.text or "").isdigit()]
+            or [1]
+        )
+        out.extend((xml_part, k if staves > 1 else None) for k in range(1, staves + 1))
+    return out
+
+
+def _xml_bar_events(xml_measure, staff, *, forwards: bool) -> dict:
+    """``{voice: [{'extend': {verse, ...}, 'cue': bool}, ...]}``: one entry per
+    note, chord or (when ``forwards``) ``<forward>`` of the bar, on ``staff``."""
+    by_voice: dict = {}
+    for child in xml_measure:
+        if child.tag not in ("note", "forward") or (
+            child.tag == "forward" and not forwards
+        ):
+            continue
+        if staff is not None and int(child.findtext("staff") or 1) != staff:
+            continue
+        v = (child.findtext("voice") or "1").strip()
+        if child.tag == "forward":
+            by_voice.setdefault(v, []).append({"extend": set(), "cue": False})
+            continue
+        extend = {
+            int(ly.get("number") or 1)
+            for ly in child.findall("lyric")
+            if ly.find("extend") is not None and ly.find("extend").get("type") != "stop"
+        }
+        cue = child.find("cue") is not None
+        if child.find("chord") is not None and by_voice.get(v):
+            by_voice[v][-1]["extend"] |= extend
+        else:
+            by_voice.setdefault(v, []).append({"extend": extend, "cue": cue})
+    return by_voice
+
+
+def _annotate_from_musicxml(score, root) -> bool:
+    """Mark what music21 does not keep from the MusicXML: the voice numbers of
+    each bar (``editorial['voices']`` on the measure), and on each note the lyric
+    numbers with an ``<extend/>`` line (``editorial['extend']``) and whether it
+    is a cue note (``editorial['cue']``). True if the document was MusicXML."""
     from music21 import stream as m21stream
 
     if root is None or root.tag != "score-partwise":
-        return
-    xml_parts = root.findall("part")
+        return False
+    staves = _xml_staves(root)
     parts = list(getattr(score, "parts", []) or [])
-    if len(xml_parts) != len(parts):  # music21 keeps the parts in document order
-        return
-    for p, xml_part in zip(parts, xml_parts):
+    if len(staves) != len(parts):  # music21 keeps parts and staves in order
+        warnings.warn(
+            f"The MusicXML has {len(staves)} staves, music21 read {len(parts)} parts: "
+            "voices of one-voice bars, cue notes and <extend/> lines are not known"
+        )
+        return True
+    for p, (xml_part, staff) in zip(parts, staves):
         measures = list(p.getElementsByClass(m21stream.Measure))
-        if len(xml_part.findall("measure")) != len(measures):
+        xml_measures = xml_part.findall("measure")
+        if len(xml_measures) != len(measures):
             continue
-        for m, xm in zip(measures, xml_part.findall("measure")):
-            by_voice: dict = {}
-            for xn in xm.findall("note"):
-                v = (xn.findtext("voice") or "1").strip()
-                extend = {
-                    int(ly.get("number") or 1)
-                    for ly in xn.findall("lyric")
-                    if ly.find("extend") is not None
-                    and ly.find("extend").get("type") != "stop"
-                }
-                if xn.find("chord") is not None and by_voice.get(v):
-                    by_voice[v][-1] |= extend
-                else:
-                    by_voice.setdefault(v, []).append(extend)
+        for m, xm in zip(measures, xml_measures):
+            by_voice = _xml_bar_events(xm, staff, forwards=False)
             m.editorial["voices"] = sorted(by_voice)
             if m.voices:
                 groups = {str(v.id): list(v.notesAndRests) for v in m.voices}
@@ -765,11 +913,25 @@ def _annotate_from_musicxml(score, root) -> None:
             else:
                 groups = {}
             for vid, elements in groups.items():
-                marks = by_voice.get(vid)
-                if marks is not None and len(marks) == len(elements):
-                    for element, extend in zip(elements, marks):
-                        if extend:
-                            element.editorial["extend"] = extend
+                _mark_notes(elements, vid, xm, staff, by_voice.get(vid), m)
+    return True
+
+
+def _mark_notes(elements, vid, xml_measure, staff, marks, measure) -> None:
+    if marks is not None and len(marks) != len(elements):
+        marks = _xml_bar_events(xml_measure, staff, forwards=True).get(vid)
+    if marks is None or len(marks) != len(elements):
+        if any(m["extend"] or m["cue"] for m in marks or ()):
+            warnings.warn(
+                f"Bar {measure.number}, voice {vid}: the MusicXML and music21 do not "
+                "agree on its notes, so its <extend/> lines and cue notes are ignored"
+            )
+        return
+    for element, mark in zip(elements, marks):
+        if mark["extend"]:
+            element.editorial["extend"] = mark["extend"]
+        if mark["cue"]:
+            element.editorial["cue"] = True
 
 
 def _part_label(i: int, p) -> str:
@@ -814,14 +976,15 @@ def _pick_part(parts, part):
     return matches[0]
 
 
-def _voice_elements(line, voice) -> list[tuple[float, Any, tuple]]:
+def _voice_elements(line, voice, *, from_xml=False) -> list[tuple[float, Any, tuple]]:
     """``[(offset_in_quarters, note_or_rest_or_None, bar)]`` of one voice of a part,
-    in time order; ``bar`` is ``(pass, bar_index)`` (the pass counts the times a
-    repeated bar was played before), None an element a silent bar of the voice.
+    in time order; ``bar`` is ``(pass, bar_index)`` (the pass counts the times the
+    same written bar was played before), None an element a silent bar of the voice.
 
     A bar music21 holds without voices belongs to the voice the MusicXML gives
     it; a bar whose voice is not known (a music21 stream with several voices in
-    other bars) is an error rather than another voice's notes sung.
+    other bars) is an error rather than another voice's notes sung. Notes a bar
+    holds outside its voices are sung with the default voice only.
     """
     from music21 import stream as m21stream
 
@@ -840,7 +1003,7 @@ def _voice_elements(line, voice) -> list[tuple[float, Any, tuple]]:
     out = []
     seen: dict = {}
     for index, m in enumerate(measures):
-        key = m.number  # expandRepeats renumbers a repeated bar 1 as 1a
+        key = m.editorial.get("bar", index)
         bar = (seen.get(key, 0), index)
         seen[key] = bar[0] + 1
         base = float(m.offset)
@@ -851,18 +1014,25 @@ def _voice_elements(line, voice) -> list[tuple[float, Any, tuple]]:
                         (base + float(v.offset) + float(el.offset), el, bar)
                         for el in v.notesAndRests
                     )
-            out.extend(  # notes held by the bar itself, outside its voices
-                (base + float(el.offset), el, bar)
-                for el in m.getElementsByClass(("Note", "Chord", "Rest"))
-            )
+            if voice is None:  # notes held by the bar itself, outside its voices
+                out.extend(
+                    (base + float(el.offset), el, bar)
+                    for el in m.getElementsByClass(("Note", "Chord", "Rest"))
+                )
             continue
         bar_voices = m.editorial.get("voices")
         if chosen is not None and bar_voices is None:
-            raise ValueError(
-                f"Bar {m.number} has one voice and others have several; which voice "
-                "it is is not known for a music21 stream: pass the MusicXML file"
+            if not from_xml:
+                raise ValueError(
+                    f"Bar {m.number} has one voice and others have several; which "
+                    "voice it is is not known for a music21 stream: pass the file"
+                )
+            warnings.warn(
+                f"Bar {m.number}: its voice is not known, its notes are sung as "
+                f"voice {chosen}"
             )
-        if chosen is None or chosen in (bar_voices or []):
+            bar_voices = [chosen]
+        if chosen is None or chosen in bar_voices:
             out.extend((base + float(el.offset), el, bar) for el in m.notesAndRests)
         else:
             out.append((base, None, bar))  # the voice is silent in this bar
@@ -891,18 +1061,23 @@ def _pick_voice(measures, ids, voice) -> str:
     )[0]
 
 
+def _sung_lyrics(el) -> list:
+    """The lyrics of a note that have text (music21 numbers a text-less lyric,
+    such as ``<extend type="stop"/>`` alone, as verse 1)."""
+    return [
+        ly
+        for ly in getattr(el, "lyrics", ())
+        if (ly.text or "").strip() or ly.isComposite
+    ]
+
+
 def _verse_chooser(elements, verse) -> Optional[Callable]:
     """``bar -> verse number``: ``verse`` throughout if given; else verse n on the
-    n-th pass through a bar when that bar has a verse n, else the lowest verse."""
-
-    def numbers_of(el):
-        return {
-            int(ly.number)
-            for ly in getattr(el, "lyrics", ())
-            if (ly.text or "").strip() or ly.isComposite
-        }
-
-    numbers = sorted(set().union(*(numbers_of(el) for _, el, _ in elements if el)))
+    n-th pass through a bar when that bar has a verse n, else the bar's only verse,
+    else the lowest verse."""
+    numbers = sorted(
+        {int(ly.number) for _, el, _ in elements if el for ly in _sung_lyrics(el)}
+    )
     if verse is not None:
         if verse not in numbers:
             raise ValueError(
@@ -914,23 +1089,36 @@ def _verse_chooser(elements, verse) -> Optional[Callable]:
     in_bar: dict = {}
     for _, el, bar in elements:
         if el is not None:
-            in_bar.setdefault(bar, set()).update(numbers_of(el))
+            in_bar.setdefault(bar, set()).update(
+                int(ly.number) for ly in _sung_lyrics(el)
+            )
 
     def verse_at(bar):
         wanted = numbers[min(bar[0], len(numbers) - 1)]
-        return wanted if wanted in in_bar.get(bar, ()) else numbers[0]
+        here = in_bar.get(bar, set())
+        if wanted in here or not here:
+            return wanted
+        return next(iter(here)) if len(here) == 1 else min(here)
 
     return verse_at
 
 
 def _verse_lyric(element, verse):
     """``(text, first_syllabic, last_syllabic, extend)`` of the element's lyric in
-    ``verse``, or None; two lyrics of one verse on one note (a chord) is an error."""
-    lyrics = [ly for ly in element.lyrics if int(ly.number) == verse]
+    ``verse``, or None. Two of one verse on a chord (from two of its notes) is an
+    error; on one note (music21 merges lyric lines that share a number but not a
+    name), the first is sung, with a warning."""
+    lyrics = [ly for ly in _sung_lyrics(element) if int(ly.number) == verse]
     if len(lyrics) > 1:
-        raise ValueError(
-            f"{len(lyrics)} lyrics of verse {verse} on one chord (measure "
-            f"{element.measureNumber}): keep one, or pick a voice with voice="
+        where = f"measure {element.measureNumber}"
+        if getattr(element, "isChord", False):
+            raise ValueError(
+                f"{len(lyrics)} lyrics of verse {verse} on one chord ({where}): keep "
+                "one, or pick a voice with voice="
+            )
+        warnings.warn(
+            f"{len(lyrics)} lyrics numbered {verse} on one note ({where}): "
+            f"singing the first, {lyrics[0].text!r}"
         )
     if not lyrics:
         return None
